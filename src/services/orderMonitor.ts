@@ -111,7 +111,7 @@ export class OrderMonitorService {
           });
           await this.onNotify(
             userId,
-            `🚨 *Liquidity Pulled (Simulated Rug)* on *${escapeMd(pos.tokenSymbol)}* (${CHAINS[pos.chain].shortBadge})\n` +
+            `🚨 *Liquidity Pulled (Rug Detected)* on *${escapeMd(pos.tokenSymbol)}* (${CHAINS[pos.chain].shortBadge})\n` +
               `Position written off at \$0.00 (Loss: ${formatUsd(res.realizedPnlUsd)})`,
             res
           );

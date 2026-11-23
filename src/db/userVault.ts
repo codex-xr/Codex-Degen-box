@@ -341,9 +341,12 @@ export class UserVault implements IUserVault {
 
   async getSettings(): Promise<UserSettings> {
     const rows = this.db
-      .prepare(`SELECT key, value FROM user_settings`)
+      .prepare(
+        `SELECT key, CASE WHEN key = 'pnl_bg_data_url' AND value <> '' THEN '1' ELSE value END AS value FROM user_settings`
+      )
       .all() as Array<{ key: string; value: string }>;
     const map = new Map(rows.map((r) => [r.key, r.value]));
+    const rawAccent = map.get("pnl_accent_hex")?.trim();
     return {
       activeChain: (map.get("active_chain") as ChainKey) ?? DEFAULT_USER_SETTINGS.activeChain,
       slippageBps: Number(map.get("slippage_bps") ?? DEFAULT_USER_SETTINGS.slippageBps),
@@ -352,6 +355,9 @@ export class UserVault implements IUserVault {
       simMode: (map.get("sim_mode") as SimMode) ?? DEFAULT_USER_SETTINGS.simMode,
       simDelayMs: Number(map.get("sim_delay_ms") ?? DEFAULT_USER_SETTINGS.simDelayMs),
       pnlTheme: (map.get("pnl_theme") as PnlTheme) ?? DEFAULT_USER_SETTINGS.pnlTheme,
+      pnlAccentHex: rawAccent && /^#[0-9a-fA-F]{6}$/.test(rawAccent) ? rawAccent : null,
+      pnlHideAmounts: map.get("pnl_hide_amounts") === "1",
+      hasPnlBg: map.get("pnl_bg_data_url") === "1",
       weeklyReportEnabled: (map.get("weekly_report_enabled") ?? "1") === "1",
       copyNotify: (map.get("copy_notify") ?? "1") === "1"
     };

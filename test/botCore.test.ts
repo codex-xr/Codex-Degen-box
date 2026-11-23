@@ -325,6 +325,61 @@ test("copy engine copies buys/sells with exact wallet attribution & generates we
   }
 });
 
+test("custom PnL card settings persist per user and render with custom bg, accent color, and hidden bag size", async () => {
+  const tmp = makeTempDir("degen-pnlstudio-");
+  try {
+    const config = loadConfig({ dataDir: tmp });
+    const vaults = new UserVaultManager(config.userVaultDir);
+    const vault = await vaults.getVault("4242");
+
+    await vault.setSetting("pnl_theme", "gold");
+    await vault.setSetting("pnl_accent_hex", "#FF5500");
+    await vault.setSetting("pnl_hide_amounts", "1");
+    const sampleJpeg =
+      "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=";
+    await vault.setSetting("pnl_bg_data_url", sampleJpeg);
+
+    const settings = await vault.getSettings();
+    assert.equal(settings.pnlTheme, "gold");
+    assert.equal(settings.pnlAccentHex, "#FF5500");
+    assert.equal(settings.pnlHideAmounts, true);
+    assert.equal(settings.hasPnlBg, true);
+    assert.equal(await vault.getSetting("pnl_bg_data_url"), sampleJpeg);
+
+    const renderer = new PnlCardRenderer();
+    const bgDataUrl = await vault.getSetting("pnl_bg_data_url");
+    const png = await renderer.renderPng({
+      theme: settings.pnlTheme,
+      accentHex: settings.pnlAccentHex,
+      hideAmounts: settings.pnlHideAmounts,
+      bgDataUrl,
+      chain: "solana",
+      tokenSymbol: "EVIL",
+      sourceLabel: "Manual Trade",
+      roiPct: 512.4,
+      pnlNativeAtomic: 5_124_000_000n,
+      pnlUsd: 1024.8,
+      investedNativeAtomic: 1_000_000_000n,
+      entryMcUsd: 25_000,
+      currentOrExitMcUsd: 153_100,
+      holdDurationMs: 620_000,
+      statusLabel: "CLOSED",
+      traderHandle: "@evil_trader"
+    });
+    assert.ok(Buffer.isBuffer(png));
+    assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+    assert.ok(png.length > 5000);
+
+    await vaults.closeAll();
+  } finally {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+    } catch {
+      // Windows Defender / SQLite WAL handle may hold temp dir briefly
+    }
+  }
+});
+
 test("PnL card renderer produces valid PNG image buffer across themes", async () => {
   const renderer = new PnlCardRenderer();
   for (const theme of ["cyber", "solana", "robinhood", "gold"] as const) {

@@ -608,7 +608,7 @@ export class WeeklyReportService {
     lines.push("");
 
     if (summary.totalPositions === 0 && summary.walletLeaderboard.length === 0) {
-      lines.push("No simulated trades or watched wallet activity recorded in this period yet.");
+      lines.push("No trades or watched wallet activity recorded in this period yet.");
       lines.push("Paste any token address to buy or add a wallet to watch!");
       return lines.join("\n");
     }
@@ -698,7 +698,7 @@ export class WeeklyReportService {
   private async tryGenerateAiCommentary(summary: WeeklySummaryData): Promise<string | null> {
     if (summary.totalPositions === 0) return null;
     const prompt =
-      "You are a friendly trading coach explaining weekly demo trading numbers in plain, simple English (no heavy jargon) in 3 short bullet points based ONLY on this JSON data:\n" +
+      "You are a friendly trading coach explaining weekly trading numbers in plain, simple English (no heavy jargon) in 3 short bullet points based ONLY on this JSON data:\n" +
       JSON.stringify({
         totalNetPnlUsd: summary.totalNetPnlUsd,
         winRatePct: summary.winRatePct,

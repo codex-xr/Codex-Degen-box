@@ -53,10 +53,10 @@ export async function formatHomeMessage(vault: IUserVault, isAdmin: boolean): Pr
   const enabledWatchers = watchers.filter((w) => w.enabled).length;
 
   const lines: string[] = [
-    `🏴‍☠️ *CODEX DEGEN BOX* ${isAdmin ? "• 👑 Admin" : ""}`,
-    `_Private Demo Trading & Copy-Alpha Lab_`,
+    `🏴‍☠️ *EVIL.FUN* ${isAdmin ? "• 👑 Admin" : ""}`,
+    `_Private Trading & Copy-Alpha Terminal_`,
     "",
-    "💰 *Your Virtual Funds (Private Vault):*"
+    "💰 *Your Wallet Funds:*"
   ];
 
   for (const spec of CHAIN_LIST) {
@@ -120,7 +120,7 @@ export function formatTokenScanMessage(
   }
 
   lines.push("");
-  lines.push(`💰 Your ${spec.shortBadge} Virtual Funds: \`${balStr} ${spec.nativeSymbol}\``);
+  lines.push(`💰 Your ${spec.shortBadge} Balance: \`${balStr} ${spec.nativeSymbol}\``);
   lines.push(
     `[Explorer](${explorerTokenUrl(snap.chain, snap.address)})${
       snap.dexUrl ? ` • [DexScreener](${snap.dexUrl})` : ""

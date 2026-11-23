@@ -12,10 +12,34 @@ function asciiClean(input: string): string {
   return input.replace(/[^\x20-\x7E]/g, "").trim() || "-";
 }
 
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const m = hex.trim().match(/^#?([0-9a-fA-F]{6})$/);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
+function resolvePalette(theme: PnlTheme, accentHex?: string | null, hasBg = false): ThemePalette {
+  const base = PALETTES[theme] ?? PALETTES.cyber;
+  const rgb = accentHex ? hexToRgb(accentHex) : null;
+  const accent = rgb ? `#${accentHex!.replace(/^#/, "").toUpperCase()}` : base.accent;
+  const border = rgb ? `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.36)` : base.border;
+  const badgeBg = rgb ? `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.18)` : base.badgeBg;
+  const panel = hasBg
+    ? "rgba(7, 11, 20, 0.72)"
+    : rgb
+      ? `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.08)`
+      : base.panel;
+  return { bg: base.bg, panel, border, accent, badgeBg };
+}
+
 const require = createRequire(import.meta.url);
 
 export interface PnlCardInput {
   theme: PnlTheme;
+  accentHex?: string | null;
+  hideAmounts?: boolean;
+  bgDataUrl?: string | null;
   chain: ChainKey;
   tokenSymbol: string;
   sourceLabel: string; // e.g., "MANUAL" or "COPIED: AlphaWhale"
@@ -100,13 +124,20 @@ export class PnlCardRenderer {
   }
 
   async renderPng(input: PnlCardInput): Promise<Buffer> {
-    const palette = PALETTES[input.theme] ?? PALETTES.cyber;
+    const validBg =
+      input.bgDataUrl && /^data:image\/(jpeg|jpg|png);base64,/i.test(input.bgDataUrl)
+        ? input.bgDataUrl
+        : null;
+    const palette = resolvePalette(input.theme, input.accentHex, Boolean(validBg));
     const spec = CHAINS[input.chain];
     const isWin = input.roiPct >= 0;
     const pnlColor = input.statusLabel === "RUGGED" ? "#EF4444" : isWin ? "#22C55E" : "#F43F5E";
-    const glowBg = isWin
-      ? "radial-gradient(circle at 85% 25%, rgba(34, 197, 94, 0.22), transparent 55%)"
-      : "radial-gradient(circle at 85% 25%, rgba(244, 63, 94, 0.22), transparent 55%)";
+    const rgb = hexToRgb(palette.accent);
+    const glowBg = rgb
+      ? `radial-gradient(circle at 85% 25%, rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.24), transparent 55%)`
+      : isWin
+        ? "radial-gradient(circle at 85% 25%, rgba(34, 197, 94, 0.22), transparent 55%)"
+        : "radial-gradient(circle at 85% 25%, rgba(244, 63, 94, 0.22), transparent 55%)";
 
     const roiText = `${input.roiPct >= 0 ? "+" : ""}${input.roiPct.toFixed(1)}%`;
     const pnlNativeText = `${input.pnlNativeAtomic >= 0n ? "+" : ""}${formatExactUnits(
@@ -121,274 +152,330 @@ export class PnlCardRenderer {
       6
     )} ${spec.nativeSymbol}`;
 
-    const element = {
-      type: "div",
-      props: {
-        style: {
-          width: "1200px",
-          height: "675px",
-          boxSizing: "border-box",
-          display: "flex",
-          flexDirection: "column",
-          justifyContent: "space-between",
-          padding: "40px 48px",
-          backgroundImage: `${glowBg}, ${palette.bg}`,
-          color: "#F8FAFC",
-          fontFamily: "Inter"
-        },
-        children: [
-          // Top Header Row
-          {
-            type: "div",
-            props: {
-              style: {
-                display: "flex",
-                flexDirection: "row",
-                justifyContent: "space-between",
-                alignItems: "center"
-              },
-              children: [
-                {
-                  type: "div",
-                  props: {
-                    style: { display: "flex", flexDirection: "row", alignItems: "center", gap: "14px" },
-                    children: [
-                      {
-                        type: "div",
-                        props: {
-                          style: {
-                            display: "flex",
-                            fontSize: "24px",
-                            fontWeight: 700,
-                            fontFamily: "Space Grotesk",
-                            letterSpacing: "1.5px",
-                            color: "#FFFFFF"
-                          },
-                          children: "CODEX DEGEN BOX"
-                        }
-                      },
-                      {
-                        type: "div",
-                        props: {
-                          style: {
-                            display: "flex",
-                            padding: "6px 14px",
-                            borderRadius: "999px",
-                            background: palette.badgeBg,
-                            border: `1px solid ${palette.border}`,
-                            fontSize: "16px",
-                            fontWeight: 600,
-                            color: palette.accent
-                          },
-                          children: `${spec.name.toUpperCase()}`
-                        }
-                      }
-                    ]
-                  }
-                },
-                {
-                  type: "div",
-                  props: {
-                    style: { display: "flex", flexDirection: "row", alignItems: "center", gap: "10px" },
-                    children: [
-                      {
-                        type: "div",
-                        props: {
-                          style: {
-                            display: "flex",
-                            padding: "6px 14px",
-                            borderRadius: "8px",
-                            background: "rgba(255,255,255,0.06)",
-                            border: `1px solid ${palette.border}`,
-                            fontSize: "15px",
-                            fontWeight: 600,
-                            color: "#CBD5E1"
-                          },
-                          children: input.sourceLabel.toUpperCase()
-                        }
-                      },
-                      {
-                        type: "div",
-                        props: {
-                          style: {
-                            display: "flex",
-                            padding: "6px 14px",
-                            borderRadius: "8px",
-                            background:
-                              input.statusLabel === "RUGGED"
-                                ? "rgba(239,68,68,0.22)"
-                                : "rgba(255,255,255,0.08)",
-                            fontSize: "15px",
-                            fontWeight: 700,
-                            color: input.statusLabel === "RUGGED" ? "#FCA5A5" : "#E2E8F0"
-                          },
-                          children: `DEMO • ${input.statusLabel}`
-                        }
-                      }
-                    ]
-                  }
-                }
-              ]
-            }
-          },
+    const safeSymbol = asciiClean(input.tokenSymbol.replace(/^\$/, ""));
+    const safeSource = asciiClean(input.sourceLabel).toUpperCase();
+    const safeTrader = input.traderHandle ? asciiClean(input.traderHandle) : "";
 
-          // Center Hero Block
-          {
-            type: "div",
-            props: {
-              style: {
-                display: "flex",
-                flexDirection: "column",
-                gap: "10px",
-                marginTop: "6px"
-              },
-              children: [
-                {
-                  type: "div",
-                  props: {
-                    style: {
-                      display: "flex",
-                      fontSize: "38px",
-                      fontWeight: 700,
-                      fontFamily: "Space Grotesk",
-                      color: "#E2E8F0"
-                    },
-                    children: `$${input.tokenSymbol.replace(/^\$/, "")}`
-                  }
-                },
-                {
-                  type: "div",
-                  props: {
-                    style: {
-                      display: "flex",
-                      fontSize: "104px",
-                      lineHeight: 1.0,
-                      fontWeight: 700,
-                      fontFamily: "Space Grotesk",
-                      color: pnlColor
-                    },
-                    children: roiText
-                  }
-                },
-                {
-                  type: "div",
-                  props: {
-                    style: {
-                      display: "flex",
-                      flexDirection: "row",
-                      alignItems: "center",
-                      gap: "18px",
-                      marginTop: "6px"
-                    },
-                    children: [
-                      {
-                        type: "div",
-                        props: {
-                          style: {
-                            display: "flex",
-                            fontSize: "34px",
-                            fontWeight: 700,
-                            fontFamily: "Space Grotesk",
-                            color: "#FFFFFF"
-                          },
-                          children: pnlNativeText
-                        }
-                      },
-                      {
-                        type: "div",
-                        props: {
-                          style: {
-                            display: "flex",
-                            fontSize: "28px",
-                            fontWeight: 600,
-                            color: "#94A3B8"
-                          },
-                          children: `(${pnlUsdText})`
-                        }
-                      }
-                    ]
-                  }
-                }
-              ]
-            }
+    const buildElement = (bgUrl: string | null) => {
+      const p = resolvePalette(input.theme, input.accentHex, Boolean(bgUrl));
+      return {
+        type: "div",
+        props: {
+          style: {
+            position: "relative",
+            width: "1200px",
+            height: "675px",
+            boxSizing: "border-box",
+            display: "flex",
+            flexDirection: "column",
+            justifyContent: "space-between",
+            padding: "40px 48px",
+            backgroundColor: "#070B14",
+            backgroundImage: bgUrl ? undefined : `${glowBg}, ${p.bg}`,
+            color: "#F8FAFC",
+            fontFamily: "Inter",
+            overflow: "hidden"
           },
-
-          // Bottom Stats Grid (Flexbox)
-          {
-            type: "div",
-            props: {
-              style: {
-                display: "flex",
-                flexDirection: "column",
-                gap: "16px"
-              },
-              children: [
-                {
-                  type: "div",
-                  props: {
-                    style: {
-                      display: "flex",
-                      flexDirection: "row",
-                      gap: "16px"
-                    },
-                    children: [
-                      this.statBox("INVESTED", investedText, palette),
-                      this.statBox("ENTRY MC", formatUsd(input.entryMcUsd), palette),
-                      this.statBox(
-                        input.statusLabel === "OPEN" ? "CURRENT MC" : "EXIT MC",
-                        formatUsd(input.currentOrExitMcUsd),
-                        palette
-                      ),
-                      this.statBox("HOLD TIME", formatDuration(input.holdDurationMs), palette)
-                    ]
-                  }
-                },
-                {
-                  type: "div",
-                  props: {
-                    style: {
-                      display: "flex",
-                      flexDirection: "row",
-                      justifyContent: "space-between",
-                      fontSize: "15px",
-                      color: "#64748B"
-                    },
-                    children: [
-                      {
-                        type: "div",
-                        props: {
-                          style: { display: "flex" },
-                          children: input.traderHandle
-                            ? `Trader: ${input.traderHandle}`
-                            : "Private Cabal Paper Trading Lab"
-                        }
-                      },
-                      {
-                        type: "div",
-                        props: {
-                          style: { display: "flex" },
-                          children: "Simulated against live on-chain liquidity & fees"
-                        }
+          children: [
+            ...(bgUrl
+              ? [
+                  {
+                    type: "img",
+                    props: {
+                      src: bgUrl,
+                      width: 1200,
+                      height: 675,
+                      style: {
+                        position: "absolute",
+                        top: 0,
+                        left: 0,
+                        width: "1200px",
+                        height: "675px",
+                        objectFit: "cover"
                       }
-                    ]
+                    }
+                  },
+                  {
+                    type: "div",
+                    props: {
+                      style: {
+                        position: "absolute",
+                        top: 0,
+                        left: 0,
+                        width: "1200px",
+                        height: "675px",
+                        display: "flex",
+                        backgroundImage: `${glowBg}, linear-gradient(135deg, rgba(6,10,19,0.82) 0%, rgba(10,16,30,0.68) 55%, rgba(6,10,19,0.86) 100%)`
+                      }
+                    }
                   }
-                }
-              ]
+                ]
+              : []),
+            // Top Header Row
+            {
+              type: "div",
+              props: {
+                style: {
+                  position: "relative",
+                  display: "flex",
+                  flexDirection: "row",
+                  justifyContent: "space-between",
+                  alignItems: "center"
+                },
+                children: [
+                  {
+                    type: "div",
+                    props: {
+                      style: { display: "flex", flexDirection: "row", alignItems: "center", gap: "14px" },
+                      children: [
+                        {
+                          type: "div",
+                          props: {
+                            style: {
+                              display: "flex",
+                              fontSize: "26px",
+                              fontWeight: 700,
+                              fontFamily: "Space Grotesk",
+                              letterSpacing: "1.5px",
+                              color: "#FFFFFF"
+                            },
+                            children: "EVIL.FUN"
+                          }
+                        },
+                        {
+                          type: "div",
+                          props: {
+                            style: {
+                              display: "flex",
+                              padding: "6px 14px",
+                              borderRadius: "999px",
+                              background: p.badgeBg,
+                              border: `1px solid ${p.border}`,
+                              fontSize: "16px",
+                              fontWeight: 600,
+                              color: p.accent
+                            },
+                            children: `${spec.name.toUpperCase()}`
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    type: "div",
+                    props: {
+                      style: { display: "flex", flexDirection: "row", alignItems: "center", gap: "10px" },
+                      children: [
+                        {
+                          type: "div",
+                          props: {
+                            style: {
+                              display: "flex",
+                              padding: "6px 14px",
+                              borderRadius: "8px",
+                              background: "rgba(255,255,255,0.08)",
+                              border: `1px solid ${p.border}`,
+                              fontSize: "15px",
+                              fontWeight: 600,
+                              color: "#E2E8F0"
+                            },
+                            children: safeSource
+                          }
+                        },
+                        {
+                          type: "div",
+                          props: {
+                            style: {
+                              display: "flex",
+                              padding: "6px 14px",
+                              borderRadius: "8px",
+                              background:
+                                input.statusLabel === "RUGGED"
+                                  ? "rgba(239,68,68,0.24)"
+                                  : "rgba(255,255,255,0.10)",
+                              border: `1px solid ${p.border}`,
+                              fontSize: "15px",
+                              fontWeight: 700,
+                              color: input.statusLabel === "RUGGED" ? "#FCA5A5" : p.accent
+                            },
+                            children: input.statusLabel
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+
+            // Center Hero Block
+            {
+              type: "div",
+              props: {
+                style: {
+                  position: "relative",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "10px",
+                  marginTop: "6px"
+                },
+                children: [
+                  {
+                    type: "div",
+                    props: {
+                      style: {
+                        display: "flex",
+                        fontSize: "38px",
+                        fontWeight: 700,
+                        fontFamily: "Space Grotesk",
+                        color: "#E2E8F0"
+                      },
+                      children: `$${safeSymbol}`
+                    }
+                  },
+                  {
+                    type: "div",
+                    props: {
+                      style: {
+                        display: "flex",
+                        fontSize: "108px",
+                        lineHeight: 1.0,
+                        fontWeight: 700,
+                        fontFamily: "Space Grotesk",
+                        color: pnlColor
+                      },
+                      children: roiText
+                    }
+                  },
+                  ...(input.hideAmounts
+                    ? []
+                    : [
+                        {
+                          type: "div",
+                          props: {
+                            style: {
+                              display: "flex",
+                              flexDirection: "row",
+                              alignItems: "center",
+                              gap: "18px",
+                              marginTop: "6px"
+                            },
+                            children: [
+                              {
+                                type: "div",
+                                props: {
+                                  style: {
+                                    display: "flex",
+                                    fontSize: "34px",
+                                    fontWeight: 700,
+                                    fontFamily: "Space Grotesk",
+                                    color: "#FFFFFF"
+                                  },
+                                  children: pnlNativeText
+                                }
+                              },
+                              {
+                                type: "div",
+                                props: {
+                                  style: {
+                                    display: "flex",
+                                    fontSize: "28px",
+                                    fontWeight: 600,
+                                    color: "#94A3B8"
+                                  },
+                                  children: `(${pnlUsdText})`
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ])
+                ]
+              }
+            },
+
+            // Bottom Stats Grid (Flexbox)
+            {
+              type: "div",
+              props: {
+                style: {
+                  position: "relative",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "16px"
+                },
+                children: [
+                  {
+                    type: "div",
+                    props: {
+                      style: {
+                        display: "flex",
+                        flexDirection: "row",
+                        gap: "16px"
+                      },
+                      children: [
+                        ...(input.hideAmounts ? [] : [this.statBox("INVESTED", investedText, p)]),
+                        this.statBox("ENTRY MC", formatUsd(input.entryMcUsd), p),
+                        this.statBox(
+                          input.statusLabel === "OPEN" ? "CURRENT MC" : "EXIT MC",
+                          formatUsd(input.currentOrExitMcUsd),
+                          p
+                        ),
+                        this.statBox("HOLD TIME", formatDuration(input.holdDurationMs), p)
+                      ]
+                    }
+                  },
+                  {
+                    type: "div",
+                    props: {
+                      style: {
+                        display: "flex",
+                        flexDirection: "row",
+                        justifyContent: "space-between",
+                        fontSize: "15px",
+                        color: "#94A3B8"
+                      },
+                      children: [
+                        {
+                          type: "div",
+                          props: {
+                            style: { display: "flex" },
+                            children: safeTrader ? `Trader: ${safeTrader}` : "Evil.fun Trading"
+                          }
+                        },
+                        {
+                          type: "div",
+                          props: {
+                            style: { display: "flex", color: p.accent, fontWeight: 600 },
+                            children: "Evil.fun • Live On-Chain Execution"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
             }
-          }
-        ]
-      }
+          ]
+        }
+      };
     };
 
-    return this.renderElementToPng(element, 1200, 675);
+    try {
+      return await this.renderElementToPng(buildElement(validBg), 1200, 675);
+    } catch {
+      // Fallback cleanly to built-in background if a custom image buffer cannot be decoded
+      return this.renderElementToPng(buildElement(null), 1200, 675);
+    }
   }
 
   async renderDetectivePng(
     report: WalletInvestigationReport,
     theme: PnlTheme,
-    alias?: string
+    alias?: string,
+    accentHex?: string | null
   ): Promise<Buffer> {
-    const palette = PALETTES[theme] ?? PALETTES.cyber;
+    const palette = resolvePalette(theme, accentHex, false);
     const spec = CHAINS[report.chain];
     const titleLabel = asciiClean(alias ? `${alias} (${shortAddress(report.address)})` : shortAddress(report.address, 8, 6));
     const roleLabel = asciiClean(report.roleSummary).toUpperCase();
@@ -628,7 +715,7 @@ export class PnlCardRenderer {
                   type: "div",
                   props: {
                     style: { display: "flex" },
-                    children: "Codex Degen Box • On-Chain Wallet Investigation"
+                    children: "Evil.fun • On-Chain Wallet Investigation"
                   }
                 }
               ]

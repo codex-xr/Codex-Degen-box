@@ -46,6 +46,9 @@ export interface UserSettings {
   simMode: SimMode;
   simDelayMs: number;
   pnlTheme: PnlTheme;
+  pnlAccentHex: string | null;
+  pnlHideAmounts: boolean;
+  hasPnlBg: boolean;
   weeklyReportEnabled: boolean;
   copyNotify: boolean;
 }
@@ -347,6 +350,9 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   simMode: "realistic",
   simDelayMs: 1500,
   pnlTheme: "cyber",
+  pnlAccentHex: null,
+  pnlHideAmounts: false,
+  hasPnlBg: false,
   weeklyReportEnabled: true,
   copyNotify: true
 };

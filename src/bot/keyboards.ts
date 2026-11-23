@@ -11,7 +11,7 @@ export type TokenRefResolver = (chain: ChainKey, address: string) => string;
 
 export function buildHomeKeyboard(isAdmin: boolean): InlineKeyboard {
   const kb = new InlineKeyboard()
-    .text("💰 Virtual Funds", "nav:funds")
+    .text("💰 Funds & Balance", "nav:funds")
     .text("⚡ Buy / Scan Token", "nav:scan")
     .row()
     .text("📈 Positions & Orders", "nav:positions")
@@ -291,12 +291,10 @@ export function buildDetectiveKeyboard(params: {
 }
 
 export function buildSettingsKeyboard(settings: UserSettings): InlineKeyboard {
-  const themes: PnlTheme[] = ["cyber", "solana", "robinhood", "gold"];
-  const nextTheme = themes[(themes.indexOf(settings.pnlTheme) + 1) % themes.length];
   return new InlineKeyboard()
     .text(`💨 Slippage: ${(settings.slippageBps / 100).toFixed(1)}%`, "set:slippage")
     .text(
-      `⏱️ Sim Mode: ${settings.simMode === "realistic" ? "Realistic" : "Ideal"}`,
+      `⏱️ Speed: ${settings.simMode === "realistic" ? "Realistic" : "Instant"}`,
       "set:toggle:simMode"
     )
     .row()
@@ -312,10 +310,51 @@ export function buildSettingsKeyboard(settings: UserSettings): InlineKeyboard {
       "set:toggle:weeklyReport"
     )
     .row()
-    .text(`🎨 Card Theme: ${settings.pnlTheme.toUpperCase()}`, `set:theme:${nextTheme}`)
-    .text("🖼️ Preview Sample PnL Card", "set:previewcard")
+    .text("🎨 Customize PnL Card", "nav:pnlstudio")
+    .text("🖼️ Preview PnL Card", "set:previewcard")
     .row()
     .text("🏠 Main Menu", "nav:home");
+}
+
+export function buildPnlStudioKeyboard(settings: UserSettings): InlineKeyboard {
+  const themes: PnlTheme[] = ["cyber", "solana", "robinhood", "gold"];
+  const nextTheme = themes[(themes.indexOf(settings.pnlTheme) + 1) % themes.length];
+  const kb = new InlineKeyboard()
+    .text(`🎨 Theme: ${settings.pnlTheme.toUpperCase()}`, `pnl:theme:${nextTheme}`)
+    .text(`🖌️ Accent: ${settings.pnlAccentHex ?? "Auto"}`, "pnl:accent:menu")
+    .row()
+    .text(
+      `🙈 Hide Bag Size: ${settings.pnlHideAmounts ? "ON" : "OFF"}`,
+      "set:toggle:pnlHideAmounts"
+    )
+    .row()
+    .text("🖼️ Upload Background Photo", "pnl:bg:ask");
+  if (settings.hasPnlBg) {
+    kb.text("🗑️ Remove Photo", "pnl:bg:clear");
+  }
+  return kb
+    .row()
+    .text("🖼️ Preview Sample PnL Card", "set:previewcard")
+    .row()
+    .text("⬅️ Back to Settings", "nav:settings")
+    .text("🏠 Main Menu", "nav:home");
+}
+
+export function buildAccentColorKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("🔵 Electric Blue", "pnl:accent:set:#38BDF8")
+    .text("🟢 Neon Green", "pnl:accent:set:#22C55E")
+    .text("💜 Purple", "pnl:accent:set:#A855F7")
+    .row()
+    .text("🟡 Gold", "pnl:accent:set:#FBBF24")
+    .text("🔴 Crimson", "pnl:accent:set:#F43F5E")
+    .text("🩷 Hot Pink", "pnl:accent:set:#EC4899")
+    .row()
+    .text("⚪ White", "pnl:accent:set:#FFFFFF")
+    .text("✏️ Custom Color", "pnl:accent:custom")
+    .text("🔄 Theme Default", "pnl:accent:clear")
+    .row()
+    .text("⬅️ Back", "nav:pnlstudio");
 }
 
 export function buildAdminKeyboard(): InlineKeyboard {

@@ -101,12 +101,24 @@ async function main(): Promise<void> {
         const pos = await vault.getPositionById(result.positionId);
         if (!pos) return;
         const wallet = pos.copiedWalletId ? await vault.getWatchedWallet(pos.copiedWalletId) : null;
-        const settings = await vault.getSettings();
+        const [settings, bgDataUrl, user, cachedHandle] = await Promise.all([
+          vault.getSettings(),
+          vault.getSetting("pnl_bg_data_url"),
+          adminDb.getUser(telegramId).catch(() => null),
+          vault.getSetting("telegram_handle")
+        ]);
+        const traderHandle =
+          user?.username
+            ? `@${user.username}`
+            : cachedHandle || user?.firstName || undefined;
         const investedUsd = pos.initialCostUsd > 0 ? pos.initialCostUsd : pos.costUsd;
         const totalPnlUsd = pos.realizedUsd - investedUsd;
         const roiPct = investedUsd > 0 ? (totalPnlUsd / investedUsd) * 100 : -100;
         const png = await pnlCards.renderPng({
           theme: settings.pnlTheme,
+          accentHex: settings.pnlAccentHex,
+          hideAmounts: settings.pnlHideAmounts,
+          bgDataUrl,
           chain: pos.chain,
           tokenSymbol: pos.tokenSymbol,
           sourceLabel: wallet ? `Copied: ${wallet.alias}` : "Auto Trade",
@@ -117,13 +129,15 @@ async function main(): Promise<void> {
           entryMcUsd: pos.entryMcUsd,
           currentOrExitMcUsd: pos.exitMcUsd ?? result.mcUsd,
           holdDurationMs: (pos.closedAt ?? Date.now()) - pos.openedAt,
-          statusLabel: pos.status.toUpperCase()
+          statusLabel: pos.status.toUpperCase(),
+          traderHandle
         });
         const safeFileSym = pos.tokenSymbol.replace(/[^a-zA-Z0-9_-]/g, "_") || "token";
+        const amountSuffix = settings.pnlHideAmounts
+          ? ""
+          : ` (${totalPnlUsd >= 0 ? "+" : ""}${formatUsd(totalPnlUsd)})`;
         await botInstance.api.sendPhoto(telegramId, new InputFile(png, `pnl-${safeFileSym}.png`), {
-          caption: `🖼️ $${pos.tokenSymbol} • ${roiPct >= 0 ? "+" : ""}${roiPct.toFixed(1)}% (${
-            totalPnlUsd >= 0 ? "+" : ""
-          }${formatUsd(totalPnlUsd)})`
+          caption: `🖼️ $${pos.tokenSymbol} • ${roiPct >= 0 ? "+" : ""}${roiPct.toFixed(1)}%${amountSuffix}`
         });
       } catch {
         // Ignore card error during notification
@@ -222,7 +236,7 @@ async function main(): Promise<void> {
   });
 
   const shutdown = async () => {
-    console.log("Shutting down Codex Degen Box...");
+    console.log("Shutting down Evil.fun...");
     orderMonitor.stop();
     weeklyReports.stopScheduler();
     await walletWatcher.stop();
@@ -236,7 +250,7 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());
 
-  console.log("Codex Degen Box is live! Listening for Telegram updates...");
+  console.log("Evil.fun is live! Listening for Telegram updates...");
   await botInstance.start();
 }
 

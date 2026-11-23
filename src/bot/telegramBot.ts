@@ -42,6 +42,7 @@ import {
   stripMdForFallback
 } from "./formatters.js";
 import {
+  buildAccentColorKeyboard,
   buildAdminKeyboard,
   buildDetectiveKeyboard,
   buildDisambiguateChainKeyboard,
@@ -49,6 +50,7 @@ import {
   buildFundsKeyboard,
   buildHistoryKeyboard,
   buildHomeKeyboard,
+  buildPnlStudioKeyboard,
   buildPositionDetailKeyboard,
   buildPositionsKeyboard,
   buildReportKeyboard,
@@ -80,6 +82,41 @@ function cleanDecimalInput(raw: string): string {
   return raw.replace(/[$,\s]/g, "");
 }
 
+const NAMED_ACCENT_COLORS: Record<string, string> = {
+  blue: "#38BDF8",
+  green: "#22C55E",
+  purple: "#A855F7",
+  pink: "#EC4899",
+  gold: "#FBBF24",
+  yellow: "#FACC15",
+  red: "#F43F5E",
+  crimson: "#F43F5E",
+  cyan: "#06B6D4",
+  orange: "#FB923C",
+  white: "#FFFFFF"
+};
+
+function resolveAccentColorInput(raw: string): string | null {
+  const cleaned = raw.trim().toLowerCase();
+  if (NAMED_ACCENT_COLORS[cleaned]) return NAMED_ACCENT_COLORS[cleaned];
+  const hex = cleaned.replace(/^#/, "");
+  if (/^[0-9a-f]{6}$/.test(hex)) return `#${hex.toUpperCase()}`;
+  if (/^[0-9a-f]{3}$/.test(hex)) {
+    return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`.toUpperCase();
+  }
+  return null;
+}
+
+function detectImageMime(buf: Buffer): "image/png" | "image/jpeg" | null {
+  if (buf.length >= 8 && buf.subarray(0, 4).toString("hex") === "89504e47") {
+    return "image/png";
+  }
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return "image/jpeg";
+  }
+  return null;
+}
+
 function splitTelegramChunks(text: string, maxLen = 3800): string[] {
   if (text.length <= maxLen) return [text];
   const chunks: string[] = [];
@@ -100,6 +137,7 @@ function splitTelegramChunks(text: string, maxLen = 3800): string[] {
 export function createTelegramBot(services: BotServices): Bot {
   const bot = new Bot(services.config.botToken);
   const sessions = new SessionStore();
+  const cachedHandles = new Map<string, string>();
   const tokenRefs = new Map<string, { chain: ChainKey; address: string }>();
   const detectiveRefs = new Map<
     string,
@@ -240,7 +278,15 @@ export function createTelegramBot(services: BotServices): Bot {
       }
       return null;
     }
-    return { telegramId, vault: await services.vaultManager.getVault(telegramId) };
+    const vault = await services.vaultManager.getVault(telegramId);
+    const handle = ctx.from?.username
+      ? `@${ctx.from.username}`
+      : ctx.from?.first_name?.trim() || "";
+    if (handle && cachedHandles.get(telegramId) !== handle) {
+      cachedHandles.set(telegramId, handle);
+      void vault.setSetting("telegram_handle", handle).catch(() => {});
+    }
+    return { telegramId, vault };
   };
 
   const sendTokenCard = async (
@@ -399,11 +445,17 @@ export function createTelegramBot(services: BotServices): Bot {
 
     const watchedWallet = pos.copiedWalletId ? await vault.getWatchedWallet(pos.copiedWalletId) : null;
     const sourceLabel = watchedWallet ? `Copied: ${watchedWallet.alias}` : "Manual Trade";
-    const settings = await vault.getSettings();
+    const [settings, bgDataUrl] = await Promise.all([
+      vault.getSettings(),
+      vault.getSetting("pnl_bg_data_url")
+    ]);
     const traderHandle = ctx.from?.username ? `@${ctx.from.username}` : ctx.from?.first_name ?? undefined;
 
     const png = await services.pnlCards.renderPng({
       theme: settings.pnlTheme,
+      accentHex: settings.pnlAccentHex,
+      hideAmounts: settings.pnlHideAmounts,
+      bgDataUrl,
       chain: pos.chain,
       tokenSymbol: pos.tokenSymbol,
       sourceLabel,
@@ -419,9 +471,12 @@ export function createTelegramBot(services: BotServices): Bot {
     });
 
     const safeFileSym = pos.tokenSymbol.replace(/[^a-zA-Z0-9_-]/g, "_") || "token";
-    const caption = `🖼️ *${escapeMd(pos.tokenSymbol)}* (${spec.name}) • ${roiPct >= 0 ? "+" : ""}${roiPct.toFixed(1)}% (${
-      pnlUsd >= 0 ? "+" : ""
-    }${formatUsd(pnlUsd)})`;
+    const amountSuffix = settings.pnlHideAmounts
+      ? ""
+      : ` (${pnlUsd >= 0 ? "+" : ""}${formatUsd(pnlUsd)})`;
+    const caption = `🖼️ *${escapeMd(pos.tokenSymbol)}* (${spec.name}) • ${
+      roiPct >= 0 ? "+" : ""
+    }${roiPct.toFixed(1)}%${amountSuffix}`;
     try {
       await ctx.replyWithPhoto(new InputFile(png, `pnl-${safeFileSym}.png`), {
         caption,
@@ -432,6 +487,41 @@ export function createTelegramBot(services: BotServices): Bot {
         caption: stripMdForFallback(caption)
       });
     }
+  };
+
+  const sendSamplePnlPreview = async (ctx: Context, vault: IUserVault) => {
+    const [s, bgDataUrl] = await Promise.all([
+      vault.getSettings(),
+      vault.getSetting("pnl_bg_data_url")
+    ]);
+    const traderHandle = ctx.from?.username
+      ? `@${ctx.from.username}`
+      : ctx.from?.first_name ?? undefined;
+    const png = await services.pnlCards.renderPng({
+      theme: s.pnlTheme,
+      accentHex: s.pnlAccentHex,
+      hideAmounts: s.pnlHideAmounts,
+      bgDataUrl,
+      chain: "solana",
+      tokenSymbol: "CASHCAT",
+      sourceLabel: "Copied: AlphaWhale",
+      roiPct: 342.8,
+      pnlNativeAtomic: 3_428_000_000n,
+      pnlUsd: 617.04,
+      investedNativeAtomic: 1_000_000_000n,
+      entryMcUsd: 42_500,
+      currentOrExitMcUsd: 188_200,
+      holdDurationMs: 14 * 60_000 + 22_000,
+      statusLabel: "CLOSED",
+      traderHandle
+    });
+    const caption = `🎨 *Evil.fun PnL Card Preview* (${s.pnlTheme.toUpperCase()}${
+      s.pnlHideAmounts ? " • Bag Hidden" : ""
+    })`;
+    return await ctx.replyWithPhoto(new InputFile(png, "evil-fun-pnl-preview.png"), {
+      caption,
+      parse_mode: "Markdown"
+    });
   };
 
   // === Commands ===
@@ -473,7 +563,7 @@ export function createTelegramBot(services: BotServices): Bot {
       sessions.set(telegramId, { kind: "await_access_code" });
       await safeReply(
         ctx,
-        `🔒 *Welcome to Codex Degen Box!*\n\nThis is a private demo trading bot.\nPlease send your *invite pass code* (given to you by the admin) to get started:`
+        `🔒 *Welcome to Evil.fun!*\n\nThis is a private trading bot.\nPlease send your *invite pass code* (given to you by the admin) to get started:`
       );
       return;
     }
@@ -561,7 +651,7 @@ export function createTelegramBot(services: BotServices): Bot {
     const closed = open.length === 0 ? await ok.vault.listClosedPositions(1) : [];
     const pos = open[0] ?? closed[0];
     if (!pos) {
-      await safeReply(ctx, "No trades found yet! Make a paper trade first.");
+      await safeReply(ctx, "No trades found yet! Make a trade first.");
       return;
     }
     await sendPnlCardForPosition(ctx, ok.vault, pos.id);
@@ -613,7 +703,7 @@ export function createTelegramBot(services: BotServices): Bot {
       services.market.getNativePriceUsd("ethereum").catch(() => 0)
     ]);
     const lines = [
-      "💰 *Your Virtual Play Money*",
+      "💰 *Your Wallet Balance*",
       "_Pick any chain below to ADD funds (in SOL/ETH or by exact USDT dollar amount!) or set a new total._",
       ""
     ];
@@ -656,7 +746,7 @@ export function createTelegramBot(services: BotServices): Bot {
   const showPositionsScreen = async (vault: IUserVault, ctx: Context, edit: boolean) => {
     const open = await vault.listOpenPositions();
     if (open.length === 0) {
-      const msg = "📈 *Open Positions*\n\nYou have no open paper trades right now.\nPaste any token address in chat to scan & buy!";
+      const msg = "📈 *Open Positions*\n\nYou have no open trades right now.\nPaste any token address in chat to scan & buy!";
       const kb = new InlineKeyboard()
         .text("🎯 Active Auto-Orders", "nav:orders")
         .text("🏠 Main Menu", "nav:home");
@@ -665,7 +755,7 @@ export function createTelegramBot(services: BotServices): Bot {
       return;
     }
 
-    const lines = ["📈 *Your Open Paper Trades*", "_Tap any coin below to sell, set auto take-profit/stop-loss, or get a PnL picture card._", ""];
+    const lines = ["📈 *Your Open Positions*", "_Tap any coin below to sell, set auto take-profit/stop-loss, or get a PnL picture card._", ""];
     for (const p of open.slice(0, 10)) {
       const spec = CHAINS[p.chain];
       const estPnlPct =
@@ -722,13 +812,13 @@ export function createTelegramBot(services: BotServices): Bot {
 
   const showHelpScreen = async (ctx: Context, edit: boolean) => {
     const text =
-      `❓ *How To Use Codex Degen Box (Simple Guide)*\n\n` +
-      `1️⃣ *Add Play Money:* Tap *Virtual Funds*, pick Solana, Ethereum, Base, or Robinhood Chain, and add by SOL/ETH or exact USDT dollar value!\n` +
+      `❓ *How To Use Evil.fun (Simple Guide)*\n\n` +
+      `1️⃣ *Add Balance:* Tap *Funds & Balance*, pick Solana, Ethereum, Base, or Robinhood Chain, and add by SOL/ETH or exact USDT dollar value!\n` +
       `2️⃣ *Buy Any Coin:* Just paste any coin address right into this chat! You'll get a safety check and quick Buy buttons.\n` +
       `3️⃣ *Investigate Any Wallet:* Paste any wallet address right into chat to see connected wallets, balances, coins launched & Twitter links!\n` +
       `4️⃣ *Copy Any Wallet Live:* Tap *Watch Wallets*, give it a nickname, and pick your copy size (or \`0\` for Alerts & Reports only).\n` +
       `5️⃣ *Wallet-by-Wallet Weekly Report:* Tap *Weekly Alpha Report* and pick one wallet at a time!\n` +
-      `6️⃣ *Flex Cards:* Tap *PnL Image Card* or *Detective Card* for shareable pictures.\n\n` +
+      `6️⃣ *Custom PnL Cards:* Go to *Settings → Customize PnL Card* to upload your own background picture, choose your color, or hide dollar amounts!\n\n` +
       `*Quick Commands:* \`/menu\`, \`/funds\`, \`/positions\`, \`/watch\`, \`/report\`, \`/pnl\`, \`/settings\``;
     const kb = new InlineKeyboard().text("🏠 Main Menu", "nav:home");
     if (edit) await safeEditOrReply(ctx, text, kb);
@@ -738,7 +828,7 @@ export function createTelegramBot(services: BotServices): Bot {
   const sendBuySuccess = async (ctx: Context, res: ExecutionResult) => {
     const spec = CHAINS[res.chain];
     const msg =
-      `✅ *Paper Buy Complete!* (${spec.name})\n\n` +
+      `✅ *Buy Complete!* (${spec.name})\n\n` +
       `🪙 Bought: *${formatExactUnits(res.qtyTokenAtomic, res.tokenDecimals, 4)} $${escapeMd(res.tokenSymbol)}*\n` +
       `💵 Spent: \`${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`\n` +
       `📊 Entry MC: *${formatUsd(res.mcUsd)}* (Impact: ${(res.slippageImpactBps / 100).toFixed(2)}%)\n` +
@@ -755,7 +845,7 @@ export function createTelegramBot(services: BotServices): Bot {
     const spec = CHAINS[res.chain];
     const sign = res.realizedPnlUsd >= 0 ? "+" : "";
     const msg =
-      `${res.side === "rug_writeoff" ? "💀 *Rugged Position Written Off*" : "✅ *Paper Sell Complete!*"} (${spec.name})\n\n` +
+      `${res.side === "rug_writeoff" ? "💀 *Rugged Position Written Off*" : "✅ *Sell Complete!*"} (${spec.name})\n\n` +
       `🪙 Token: *$${escapeMd(res.tokenSymbol)}*\n` +
       `💰 Received: \`${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`\n` +
       `📈 Realized Profit/Loss: *${sign}${formatUsd(res.realizedPnlUsd)}*\n` +
@@ -766,6 +856,21 @@ export function createTelegramBot(services: BotServices): Bot {
       .text("📈 Positions", "nav:positions")
       .text("🏠 Main Menu", "nav:home");
     await safeReply(ctx, msg, kb);
+  };
+
+  const showPnlStudioScreen = async (vault: IUserVault, ctx: Context, edit: boolean) => {
+    const s = await vault.getSettings();
+    const text =
+      `🎨 *Customize Your Evil.fun PnL Card*\n\n` +
+      `• *Theme:* ${s.pnlTheme.toUpperCase()}\n` +
+      `• *Accent Color:* ${s.pnlAccentHex ? `\`${s.pnlAccentHex}\`` : "Theme Default"}\n` +
+      `• *Custom Background Photo:* ${s.hasPnlBg ? "✅ Uploaded" : "None (using theme gradient)"}\n` +
+      `• *Hide Bag Size (ROI % Only):* *${s.pnlHideAmounts ? "ON" : "OFF"}*\n` +
+      `• *Trader Tag:* ${ctx.from?.username ? `\`@${escapeMd(ctx.from.username)}\`` : "_Your Telegram username_"}\n\n` +
+      `_Tap any option below to customize how your shareable PnL card looks:_`;
+    const kb = buildPnlStudioKeyboard(s);
+    if (edit) await safeEditOrReply(ctx, text, kb);
+    else await safeReply(ctx, text, kb);
   };
 
   // === Callback Queries (All Inline Menu Buttons) ===
@@ -848,9 +953,13 @@ export function createTelegramBot(services: BotServices): Bot {
       if (data === "nav:settings") {
         return await safeEditOrReply(
           ctx,
-          "⚙️ *Trading & Simulation Settings*",
+          "⚙️ *Evil.fun Trading & Card Settings*",
           buildSettingsKeyboard(await vault.getSettings())
         );
+      }
+
+      if (data === "nav:pnlstudio") {
+        return await showPnlStudioScreen(vault, ctx, true);
       }
 
       if (data === "nav:admin") {
@@ -872,7 +981,7 @@ export function createTelegramBot(services: BotServices): Bot {
           nativePriceUsd > 0 ? `\n📊 Live Price: *1 ${spec.nativeSymbol} ≈ ${formatUsd(nativePriceUsd)} USDT*` : "";
         return await safeEditOrReply(
           ctx,
-          `${spec.emoji} *${spec.name} Virtual Balance*\nCurrent: \`${formatExactUnits(bal, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
+          `${spec.emoji} *${spec.name} Balance*\nCurrent: \`${formatExactUnits(bal, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
             nativePriceUsd > 0 ? ` (~*${formatUsd(usdVal)} USDT*)` : ""
           }${rateStr}\n\nPick a quick *+Add* button, add by exact *USDT dollar value*, or set a new balance:`,
           buildEditChainFundsKeyboard(chain, nativePriceUsd)
@@ -933,7 +1042,7 @@ export function createTelegramBot(services: BotServices): Bot {
         await vault.setVirtualFunds(chain, amt, true);
         await safeReply(
           ctx,
-          `✅ Set your *${spec.name}* virtual balance to \`${formatExactUnits(amt, spec.nativeDecimals)} ${spec.nativeSymbol}\`!`
+          `✅ Set your *${spec.name}* balance to \`${formatExactUnits(amt, spec.nativeDecimals)} ${spec.nativeSymbol}\`!`
         );
         return await showFundsScreen(vault, ctx, false);
       }
@@ -1011,7 +1120,7 @@ export function createTelegramBot(services: BotServices): Bot {
         }, vault);
         return await safeReply(
           ctx,
-          `✏️ How much virtual *${spec.nativeSymbol}* do you want to spend? (Any decimal allowed)`
+          `✏️ How much *${spec.nativeSymbol}* do you want to spend? (Any decimal allowed)`
         );
       }
 
@@ -1290,7 +1399,12 @@ export function createTelegramBot(services: BotServices): Bot {
           cachedRef?.report ?? (await services.detective.investigateWallet(targetChain, norm, 7));
         const s = await vault.getSettings();
         const alias = cachedRef?.alias ?? watchedMatch?.alias;
-        const png = await services.pnlCards.renderDetectivePng(report, s.pnlTheme, alias);
+        const png = await services.pnlCards.renderDetectivePng(
+          report,
+          s.pnlTheme,
+          alias,
+          s.pnlAccentHex
+        );
         return await ctx.replyWithPhoto(new InputFile(png, `detective-${shortAddress(norm, 4, 4)}.png`), {
           caption: `🕵️‍♂️ *Wallet Detective Card* • ${CHAINS[targetChain].shortBadge} • \`${shortAddress(norm)}\``,
           parse_mode: "Markdown"
@@ -1337,7 +1451,12 @@ export function createTelegramBot(services: BotServices): Bot {
         const report =
           ref.report ?? (await services.detective.investigateWallet(ref.chain, ref.address, 7));
         const s = await vault.getSettings();
-        const png = await services.pnlCards.renderDetectivePng(report, s.pnlTheme, ref.alias);
+        const png = await services.pnlCards.renderDetectivePng(
+          report,
+          s.pnlTheme,
+          ref.alias,
+          s.pnlAccentHex
+        );
         return await ctx.replyWithPhoto(new InputFile(png, `detective-${shortAddress(ref.address, 4, 4)}.png`), {
           caption: `🕵️‍♂️ *Wallet Detective Card* • ${CHAINS[ref.chain].shortBadge} • \`${shortAddress(ref.address)}\``,
           parse_mode: "Markdown"
@@ -1397,7 +1516,7 @@ export function createTelegramBot(services: BotServices): Bot {
         setPrompt(telegramId, { kind: "await_gas_fee", chain }, vault);
         return await safeReply(
           ctx,
-          `⛽ Type your simulated network fee in *${CHAINS[chain].nativeSymbol}* (or \`0\` for zero fee):`
+          `⛽ Type your network fee in *${CHAINS[chain].nativeSymbol}* (or \`0\` for zero fee):`
         );
       }
 
@@ -1409,10 +1528,13 @@ export function createTelegramBot(services: BotServices): Bot {
           await vault.setSetting("copy_notify", s.copyNotify ? "0" : "1");
         } else if (parts[2] === "weeklyReport") {
           await vault.setSetting("weekly_report_enabled", s.weeklyReportEnabled ? "0" : "1");
+        } else if (parts[2] === "pnlHideAmounts") {
+          await vault.setSetting("pnl_hide_amounts", s.pnlHideAmounts ? "0" : "1");
+          return await showPnlStudioScreen(vault, ctx, true);
         }
         return await safeEditOrReply(
           ctx,
-          "⚙️ *Trading & Simulation Settings*",
+          "⚙️ *Evil.fun Trading & Card Settings*",
           buildSettingsKeyboard(await vault.getSettings())
         );
       }
@@ -1421,32 +1543,54 @@ export function createTelegramBot(services: BotServices): Bot {
         await vault.setSetting("pnl_theme", parts[2] as PnlTheme);
         return await safeEditOrReply(
           ctx,
-          "⚙️ *Trading & Simulation Settings*",
+          "⚙️ *Evil.fun Trading & Card Settings*",
           buildSettingsKeyboard(await vault.getSettings())
         );
       }
 
+      if (parts[0] === "pnl") {
+        if (parts[1] === "theme") {
+          await vault.setSetting("pnl_theme", parts[2] as PnlTheme);
+          return await showPnlStudioScreen(vault, ctx, true);
+        }
+        if (parts[1] === "accent" && parts[2] === "menu") {
+          return await safeEditOrReply(
+            ctx,
+            "🖌️ *Choose Your PnL Card Accent Color*\nPick a preset color below or type any color/hex code:",
+            buildAccentColorKeyboard()
+          );
+        }
+        if (parts[1] === "accent" && parts[2] === "set" && parts[3]) {
+          const hex = resolveAccentColorInput(parts[3]);
+          if (hex) await vault.setSetting("pnl_accent_hex", hex);
+          return await showPnlStudioScreen(vault, ctx, true);
+        }
+        if (parts[1] === "accent" && parts[2] === "clear") {
+          await vault.setSetting("pnl_accent_hex", "");
+          return await showPnlStudioScreen(vault, ctx, true);
+        }
+        if (parts[1] === "accent" && parts[2] === "custom") {
+          setPrompt(telegramId, { kind: "await_pnl_accent" }, vault);
+          return await safeReply(
+            ctx,
+            "🖌️ Type any hex color (like `#FF5500` or `#00FFAA`) OR a color word (like `red`, `purple`, `gold`, `cyan`, `pink`, `orange`):"
+          );
+        }
+        if (parts[1] === "bg" && parts[2] === "ask") {
+          setPrompt(telegramId, { kind: "await_pnl_bg" }, vault);
+          return await safeReply(
+            ctx,
+            "🖼️ *Send your background picture right now!* (Send any photo or JPG/PNG image — best in landscape `16:9` ratio)."
+          );
+        }
+        if (parts[1] === "bg" && parts[2] === "clear") {
+          await vault.setSetting("pnl_bg_data_url", "");
+          return await showPnlStudioScreen(vault, ctx, true);
+        }
+      }
+
       if (data === "set:previewcard") {
-        const s = await vault.getSettings();
-        const png = await services.pnlCards.renderPng({
-          theme: s.pnlTheme,
-          chain: "solana",
-          tokenSymbol: "CASHCAT",
-          sourceLabel: "Copied: AlphaWhale",
-          roiPct: 342.8,
-          pnlNativeAtomic: 3_428_000_000n,
-          pnlUsd: 617.04,
-          investedNativeAtomic: 1_000_000_000n,
-          entryMcUsd: 42_500,
-          currentOrExitMcUsd: 188_200,
-          holdDurationMs: 14 * 60_000 + 22_000,
-          statusLabel: "CLOSED",
-          traderHandle: ctx.from?.username ? `@${ctx.from.username}` : undefined
-        });
-        return await ctx.replyWithPhoto(new InputFile(png, "sample-pnl.png"), {
-          caption: `🎨 Preview of *${s.pnlTheme.toUpperCase()}* PnL Card Theme`,
-          parse_mode: "Markdown"
-        });
+        return await sendSamplePnlPreview(ctx, vault);
       }
 
       // Admin
@@ -1887,7 +2031,7 @@ export function createTelegramBot(services: BotServices): Bot {
             ctx,
             copyAmountAtomic === 0n && copyMode === "fixed"
               ? `🎉 *Now Watching ${escapeMd(w.alias)} (Alert & Investigate Mode)!*\nYou'll get instant funding alerts + weekly detective reports for *${spec.name}*.`
-              : `🎉 *Now Watching ${escapeMd(w.alias)} Live!*\nThe very second this wallet trades on *${spec.name}*, your demo vault will copy it automatically.`
+              : `🎉 *Now Watching ${escapeMd(w.alias)} Live!*\nThe very second this wallet trades on *${spec.name}*, your vault will copy it automatically.`
           );
           return await safeReply(ctx, formatWatchedWalletMessage(w), buildWatcherDetailKeyboard(w));
         }
@@ -2009,8 +2153,30 @@ export function createTelegramBot(services: BotServices): Bot {
           clearPrompt(telegramId, vault);
           return await safeReply(
             ctx,
-            `✅ Simulated network fee updated to \`${formatted} ${spec.nativeSymbol}\`.`,
+            `✅ Network fee updated to \`${formatted} ${spec.nativeSymbol}\`.`,
             buildSettingsKeyboard(await vault.getSettings())
+          );
+        }
+
+        case "await_pnl_accent": {
+          const hex = resolveAccentColorInput(text);
+          if (!hex) {
+            throw new Error("Send a hex code like `#FF5500` or a color word like `red`, `purple`, `gold`, `blue`, `green`, `pink`.");
+          }
+          await vault.setSetting("pnl_accent_hex", hex);
+          clearPrompt(telegramId, vault);
+          await safeReply(ctx, `✅ PnL Card accent color set to \`${hex}\`!`);
+          return await showPnlStudioScreen(vault, ctx, false);
+        }
+
+        case "await_pnl_bg": {
+          if (text.toLowerCase() === "cancel" || text.toLowerCase() === "skip") {
+            clearPrompt(telegramId, vault);
+            return await showPnlStudioScreen(vault, ctx, false);
+          }
+          return await safeReply(
+            ctx,
+            "🖼️ Please send a *photo* or *PNG/JPG image* right here (or tap a menu button / send `cancel`)."
           );
         }
 
@@ -2033,6 +2199,67 @@ export function createTelegramBot(services: BotServices): Bot {
     } catch (err) {
       await safeReply(ctx, `❌ ${(err as Error).message}`);
     }
+  });
+
+  const handleUploadedPnlBg = async (ctx: Context, fileId: string, fileSize?: number) => {
+    const ok = await requireAuthorized(ctx);
+    if (!ok) return;
+    const { telegramId, vault } = ok;
+    const pending = await getPrompt(telegramId, vault);
+    if (pending?.kind !== "await_pnl_bg") {
+      await safeReply(
+        ctx,
+        "💡 To use that photo as your PnL Card background, tap *Settings → 🎨 Customize PnL Card → 🖼️ Upload Background Photo* first!"
+      );
+      return;
+    }
+
+    try {
+      if (fileSize && fileSize > 1_500_000) {
+        throw new Error("That image is larger than 1.5 MB. Please send it as a regular Telegram photo or a smaller PNG/JPG.");
+      }
+      const file = await ctx.api.getFile(fileId);
+      if (!file.file_path) {
+        throw new Error("Could not download that image from Telegram.");
+      }
+      const res = await fetch(
+        `https://api.telegram.org/file/bot${services.config.botToken}/${file.file_path}`,
+        { signal: AbortSignal.timeout(10_000) }
+      );
+      if (!res.ok) throw new Error("Failed downloading image from Telegram.");
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length > 1_600_000) {
+        throw new Error("Image is too big (max 1.5 MB). Try sending a compressed photo!");
+      }
+      const mime = detectImageMime(buf);
+      if (!mime) {
+        throw new Error("Unsupported image format. Please send a normal photo, JPG, or PNG image.");
+      }
+      const dataUrl = `data:${mime};base64,${buf.toString("base64")}`;
+      await vault.setSetting("pnl_bg_data_url", dataUrl);
+      clearPrompt(telegramId, vault);
+      await safeReply(ctx, "✅ Custom PnL Card background saved! Here is your live preview:");
+      await sendSamplePnlPreview(ctx, vault);
+      await showPnlStudioScreen(vault, ctx, false);
+    } catch (err) {
+      await safeReply(ctx, `❌ ${(err as Error).message}`);
+    }
+  };
+
+  bot.on("message:photo", async (ctx) => {
+    const photos = ctx.message.photo;
+    if (!photos || photos.length === 0) return;
+    const picked =
+      [...photos].reverse().find((p) => (p.file_size ?? 0) <= 1_500_000) ?? photos[0];
+    await handleUploadedPnlBg(ctx, picked.file_id, picked.file_size);
+  });
+
+  bot.on("message:document", async (ctx) => {
+    const doc = ctx.message.document;
+    if (!doc) return;
+    const mime = doc.mime_type?.toLowerCase() ?? "";
+    if (!mime.startsWith("image/")) return;
+    await handleUploadedPnlBg(ctx, doc.file_id, doc.file_size);
   });
 
   bot.catch((err) => {

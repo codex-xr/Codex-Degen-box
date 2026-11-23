@@ -20,6 +20,8 @@ export type PendingPrompt =
   | { kind: "await_edit_watch_filter"; walletId: number; field: "min_mc" | "max_mc" | "min_liq" | "tp_sl" }
   | { kind: "await_slippage" }
   | { kind: "await_gas_fee"; chain: ChainKey }
+  | { kind: "await_pnl_bg" }
+  | { kind: "await_pnl_accent" }
   | { kind: "await_admin_code_label"; maxUses: number };
 
 export class SessionStore {
