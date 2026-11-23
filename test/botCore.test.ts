@@ -346,6 +346,15 @@ test("custom PnL card settings persist per user and render with custom bg, accen
     assert.equal(settings.hasPnlBg, true);
     assert.equal(await vault.getSetting("pnl_bg_data_url"), sampleJpeg);
 
+    // Also verify loadConfig upgrades generic public BASE_RPC_URL when ALCHEMY_API_KEY is supplied
+    const prevBase = process.env.BASE_RPC_URL;
+    process.env.BASE_RPC_URL = "https://mainnet.base.org";
+    const upgradedCfg = loadConfig({ dataDir: tmp, alchemyApiKey: "test_alch_key", heliusApiKey: "test_hel_key" });
+    assert.equal(upgradedCfg.baseRpcUrl, "https://base-mainnet.g.alchemy.com/v2/test_alch_key");
+    assert.equal(upgradedCfg.solanaRpcUrl, "https://mainnet.helius-rpc.com/?api-key=test_hel_key");
+    if (prevBase === undefined) delete process.env.BASE_RPC_URL;
+    else process.env.BASE_RPC_URL = prevBase;
+
     const renderer = new PnlCardRenderer();
     const bgDataUrl = await vault.getSetting("pnl_bg_data_url");
     const png = await renderer.renderPng({

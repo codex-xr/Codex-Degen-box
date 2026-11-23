@@ -51,6 +51,22 @@ export interface AppConfig {
   weeklyReportHourUtc: number;
 }
 
+function resolvePreferredUrl(
+  overrideVal: string | undefined,
+  envVal: string | undefined,
+  defaultVal: string,
+  hasKeyUpgrade: boolean,
+  publicDefaults: string[]
+): string {
+  if (overrideVal !== undefined) return overrideVal.trim();
+  const trimmed = (envVal ?? "").trim();
+  if (!trimmed) return defaultVal;
+  if (hasKeyUpgrade && publicDefaults.includes(trimmed.replace(/\/+$/, ""))) {
+    return defaultVal;
+  }
+  return trimmed;
+}
+
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   const dataDir = path.resolve(overrides.dataDir ?? process.env.DATA_DIR ?? "./data");
   const heliusApiKey = (overrides.heliusApiKey ?? process.env.HELIUS_API_KEY ?? "").trim();
@@ -88,12 +104,48 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     heliusApiKey,
     alchemyApiKey,
     blockscoutApiKey,
-    solanaRpcUrl: (overrides.solanaRpcUrl ?? process.env.SOLANA_RPC_URL ?? defaultSolRpc).trim(),
-    solanaWsUrl: (overrides.solanaWsUrl ?? process.env.SOLANA_WS_URL ?? defaultSolWs).trim(),
-    ethRpcUrl: (overrides.ethRpcUrl ?? process.env.ETH_RPC_URL ?? defaultEthRpc).trim(),
-    ethWsUrl: (overrides.ethWsUrl ?? process.env.ETH_WS_URL ?? defaultEthWs).trim(),
-    baseRpcUrl: (overrides.baseRpcUrl ?? process.env.BASE_RPC_URL ?? defaultBaseRpc).trim(),
-    baseWsUrl: (overrides.baseWsUrl ?? process.env.BASE_WS_URL ?? defaultBaseWs).trim(),
+    solanaRpcUrl: resolvePreferredUrl(
+      overrides.solanaRpcUrl,
+      process.env.SOLANA_RPC_URL,
+      defaultSolRpc,
+      Boolean(heliusApiKey),
+      ["https://api.mainnet-beta.solana.com", "https://solana-rpc.publicnode.com"]
+    ),
+    solanaWsUrl: resolvePreferredUrl(
+      overrides.solanaWsUrl,
+      process.env.SOLANA_WS_URL,
+      defaultSolWs,
+      Boolean(heliusApiKey),
+      ["wss://api.mainnet-beta.solana.com"]
+    ),
+    ethRpcUrl: resolvePreferredUrl(
+      overrides.ethRpcUrl,
+      process.env.ETH_RPC_URL,
+      defaultEthRpc,
+      Boolean(alchemyApiKey),
+      ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"]
+    ),
+    ethWsUrl: resolvePreferredUrl(
+      overrides.ethWsUrl,
+      process.env.ETH_WS_URL,
+      defaultEthWs,
+      Boolean(alchemyApiKey),
+      ["wss://ethereum-rpc.publicnode.com"]
+    ),
+    baseRpcUrl: resolvePreferredUrl(
+      overrides.baseRpcUrl,
+      process.env.BASE_RPC_URL,
+      defaultBaseRpc,
+      Boolean(alchemyApiKey),
+      ["https://mainnet.base.org", "https://base.drpc.org", "https://1rpc.io/base"]
+    ),
+    baseWsUrl: resolvePreferredUrl(
+      overrides.baseWsUrl,
+      process.env.BASE_WS_URL,
+      defaultBaseWs,
+      Boolean(alchemyApiKey),
+      ["wss://base-rpc.publicnode.com"]
+    ),
     robinhoodRpcUrl: (
       overrides.robinhoodRpcUrl ??
       process.env.ROBINHOOD_RPC_URL ??
