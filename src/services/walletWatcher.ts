@@ -580,6 +580,7 @@ export class WalletWatcherService {
         side: "sell",
         tokenAddress: soldToken[0],
         walletNativeAmountAtomic: nativeAmt,
+        walletTokenAmount: soldToken[1],
         dex: tx.source,
         detectedAt: Date.now()
       });
@@ -601,6 +602,7 @@ export class WalletWatcherService {
         side: "buy",
         tokenAddress: boughtToken[0],
         walletNativeAmountAtomic: nativeAmt,
+        walletTokenAmount: boughtToken[1],
         dex: tx.source,
         detectedAt: Date.now()
       });
@@ -623,21 +625,26 @@ export class WalletWatcherService {
 
     const preMap = new Map<string, bigint>();
     const postMap = new Map<string, bigint>();
+    const decMap = new Map<string, number>();
 
     for (const b of meta.preTokenBalances ?? []) {
       if (b.owner === walletAddress && b.mint) {
         preMap.set(b.mint, (preMap.get(b.mint) ?? 0n) + BigInt(b.uiTokenAmount?.amount || "0"));
+        if (typeof b.uiTokenAmount?.decimals === "number") decMap.set(b.mint, b.uiTokenAmount.decimals);
       }
     }
     for (const b of meta.postTokenBalances ?? []) {
       if (b.owner === walletAddress && b.mint) {
         postMap.set(b.mint, (postMap.get(b.mint) ?? 0n) + BigInt(b.uiTokenAmount?.amount || "0"));
+        if (typeof b.uiTokenAmount?.decimals === "number") decMap.set(b.mint, b.uiTokenAmount.decimals);
       }
     }
 
     const allMints = new Set([...preMap.keys(), ...postMap.keys()]);
     let boughtMint: string | null = null;
+    let boughtAtomic = 0n;
     let soldMint: string | null = null;
+    let soldAtomic = 0n;
     let quoteSpent = false;
     let quoteGained = false;
 
@@ -648,8 +655,14 @@ export class WalletWatcherService {
         if (diff < 0n) quoteSpent = true;
         if (diff > 0n) quoteGained = true;
       } else {
-        if (diff > 0n && !boughtMint) boughtMint = mint;
-        if (diff < 0n && !soldMint) soldMint = mint;
+        if (diff > 0n && !boughtMint) {
+          boughtMint = mint;
+          boughtAtomic = diff;
+        }
+        if (diff < 0n && !soldMint) {
+          soldMint = mint;
+          soldAtomic = -diff;
+        }
       }
     }
 
@@ -670,6 +683,7 @@ export class WalletWatcherService {
         side: "sell",
         tokenAddress: soldMint,
         walletNativeAmountAtomic: solDelta > 0n ? solDelta : null,
+        walletTokenAmount: atomicToNumber(soldAtomic, decMap.get(soldMint) ?? 6),
         detectedAt: Date.now()
       });
     }
@@ -682,6 +696,7 @@ export class WalletWatcherService {
         side: "buy",
         tokenAddress: boughtMint,
         walletNativeAmountAtomic: solDelta < 0n ? -solDelta : null,
+        walletTokenAmount: atomicToNumber(boughtAtomic, decMap.get(boughtMint) ?? 6),
         detectedAt: Date.now()
       });
     }
@@ -1082,8 +1097,16 @@ interface RawSolanaParsedTx {
     preBalances?: number[];
     postBalances?: number[];
     loadedAddresses?: { writable?: string[]; readonly?: string[] };
-    preTokenBalances?: Array<{ owner?: string; mint?: string; uiTokenAmount?: { amount?: string } }>;
-    postTokenBalances?: Array<{ owner?: string; mint?: string; uiTokenAmount?: { amount?: string } }>;
+    preTokenBalances?: Array<{
+      owner?: string;
+      mint?: string;
+      uiTokenAmount?: { amount?: string; decimals?: number };
+    }>;
+    postTokenBalances?: Array<{
+      owner?: string;
+      mint?: string;
+      uiTokenAmount?: { amount?: string; decimals?: number };
+    }>;
   } | null;
   transaction?: {
     message?: {

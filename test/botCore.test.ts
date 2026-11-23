@@ -908,3 +908,124 @@ test("marketData recovers SOL and ETH USD prices via Helius, GeckoTerminal, and 
     fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
   }
 });
+
+test("copyEngine copies brand-new unindexed PumpSwap buys via on-chain fallback and skips nameless LP mints", async () => {
+  const tmp = makeTempDir("degen-onchain-copy-");
+  const origFetch = globalThis.fetch;
+  try {
+    const config = loadConfig({ dataDir: tmp, heliusApiKey: "test_helius_key" });
+    const vaults = new UserVaultManager(config.userVaultDir);
+    const evm = new EvmClientManager(config);
+    const sol = new SolanaClientManager(config);
+
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("dexscreener.com")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes("geckoterminal.com") || url.includes("pump.fun")) {
+        return new Response(JSON.stringify({}), { status: 404 });
+      }
+      if (url.includes("helius-rpc.com")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        const assetId = body?.params?.id;
+        if (assetId === "So11111111111111111111111111111111111111112") {
+          return new Response(
+            JSON.stringify({ result: { token_info: { price_info: { price_per_token: 75 } } } }),
+            { status: 200 }
+          );
+        }
+        if (assetId === "FreshPumpMint1111111111111111111111111111111") {
+          return new Response(
+            JSON.stringify({
+              result: {
+                content: { metadata: { symbol: "FRESH", name: "Fresh Launch" } },
+                token_info: { symbol: "FRESH", decimals: 6, supply: 1_000_000_000_000_000 }
+              }
+            }),
+            { status: 200 }
+          );
+        }
+        if (assetId === "NamelessLpMint111111111111111111111111111111") {
+          return new Response(
+            JSON.stringify({
+              result: { token_info: { decimals: 9, supply: 14_142_135_623_630 } }
+            }),
+            { status: 200 }
+          );
+        }
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const market = new MarketDataService(config, evm, sol);
+    const sec = new SecurityService();
+    sec.checkToken = async () => makeSafeSecurity("solana");
+    const trading = new TradingEngine(market, sec);
+    const notes: string[] = [];
+    const copy = new CopyEngine({
+      vaultManager: vaults,
+      market,
+      security: sec,
+      trading,
+      onNotify: async (_uid, msg) => {
+        notes.push(msg);
+      },
+      snapshotRetryDelaysMs: [0]
+    });
+
+    const vault = await vaults.getVault("999");
+    await vault.setVirtualFunds("solana", parseExactUnits("1", 9));
+    await vault.setSetting("sim_delay_ms", "0");
+    await vault.setSetting("priority_fee_sol", "0");
+
+    const wId = await vault.addWatchedWallet({
+      chain: "solana",
+      address: "WhaleFresh11111111111111111111111111111111",
+      alias: "$8k+",
+      copyMode: "percent_balance",
+      copyAmountAtomic: 0n,
+      copyPercent: 5,
+      blockRisky: false,
+      simMode: "ideal"
+    });
+    const watched = (await vault.getWatchedWallet(wId))!;
+
+    // 1. Real unindexed PumpSwap coin -> recovered cleanly from on-chain swap ratio + Helius metadata
+    await copy.processSwapForUser("999", watched, {
+      chain: "solana",
+      walletAddress: watched.address,
+      txHash: "sig_fresh_buy",
+      side: "buy",
+      tokenAddress: "FreshPumpMint1111111111111111111111111111111",
+      walletNativeAmountAtomic: 100_000_000n, // 0.1 SOL ($7.50)
+      walletTokenAmount: 375_000, // => $0.00002/token ($20k MC)
+      dex: "PUMP_AMM",
+      detectedAt: Date.now()
+    });
+
+    // 2. Nameless LP mint -> still safely skipped
+    await copy.processSwapForUser("999", watched, {
+      chain: "solana",
+      walletAddress: watched.address,
+      txHash: "sig_lp_mint",
+      side: "buy",
+      tokenAddress: "NamelessLpMint111111111111111111111111111111",
+      walletNativeAmountAtomic: 100_000_000n,
+      walletTokenAmount: 500,
+      dex: "RAYDIUM",
+      detectedAt: Date.now()
+    });
+
+    const open = await vault.listOpenPositions();
+    assert.equal(open.length, 1);
+    assert.equal(open[0].tokenSymbol, "FRESH");
+    assert.ok(open[0].entryMcUsd >= 19_000 && open[0].entryMcUsd <= 21_000, `MC=${open[0].entryMcUsd}`);
+    assert.ok(notes.some((n) => n.includes("Instant Copy Buy") && n.includes("FRESH")));
+
+    await vaults.closeAll();
+  } finally {
+    globalThis.fetch = origFetch;
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+  }
+});

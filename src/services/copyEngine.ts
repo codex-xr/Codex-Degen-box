@@ -14,6 +14,7 @@ export interface DetectedWalletSwap {
   tokenAddress: string;
   tokenSymbolHint?: string;
   walletNativeAmountAtomic: bigint | null;
+  walletTokenAmount?: number;
   dex?: string;
   detectedAt: number;
 }
@@ -30,6 +31,7 @@ export class CopyEngine {
   private readonly security: SecurityService;
   private readonly trading: TradingEngine;
   private readonly onNotify: CopyNotifyCallback;
+  private readonly snapshotRetryDelaysMs: number[];
 
   constructor(params: {
     vaultManager: IVaultManager;
@@ -37,12 +39,14 @@ export class CopyEngine {
     security: SecurityService;
     trading: TradingEngine;
     onNotify: CopyNotifyCallback;
+    snapshotRetryDelaysMs?: number[];
   }) {
     this.vaultManager = params.vaultManager;
     this.market = params.market;
     this.security = params.security;
     this.trading = params.trading;
     this.onNotify = params.onNotify;
+    this.snapshotRetryDelaysMs = params.snapshotRetryDelaysMs ?? [2500, 4000];
   }
 
   async processSwapForUser(
@@ -83,7 +87,41 @@ export class CopyEngine {
       await new Promise((r) => setTimeout(r, simDelayMs));
     }
 
-    const snap = await this.market.getTokenSnapshot(swap.chain, swap.tokenAddress, 1500);
+    let snap = await this.market.getTokenSnapshot(swap.chain, swap.tokenAddress, 1500);
+    if (!snap && swap.side === "buy") {
+      for (const waitMs of this.snapshotRetryDelaysMs) {
+        if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+        snap = await this.market.getTokenSnapshot(swap.chain, swap.tokenAddress, 1500);
+        if (snap) break;
+      }
+      if (!snap && swap.chain === "solana") {
+        snap = await this.market.buildOnChainSolanaSnapshot({
+          tokenAddress: swap.tokenAddress,
+          walletNativeAmountAtomic: swap.walletNativeAmountAtomic,
+          walletTokenAmount: swap.walletTokenAmount,
+          dex: swap.dex,
+          hasExplicitMinLiq: wallet.minLiqUsd !== null
+        });
+      }
+    } else if (!snap && swap.side === "sell" && wallet.mirrorSells) {
+      const openPos = await vault.getOpenPosition(swap.chain, swap.tokenAddress, wallet.id);
+      if (openPos) {
+        if ((this.snapshotRetryDelaysMs[0] ?? 0) > 0) {
+          await new Promise((r) => setTimeout(r, this.snapshotRetryDelaysMs[0]));
+        }
+        snap = await this.market.getTokenSnapshot(swap.chain, swap.tokenAddress, 1500);
+        if (!snap && swap.chain === "solana") {
+          snap = await this.market.buildOnChainSolanaSnapshot({
+            tokenAddress: swap.tokenAddress,
+            walletNativeAmountAtomic: swap.walletNativeAmountAtomic,
+            walletTokenAmount: swap.walletTokenAmount,
+            dex: swap.dex,
+            hasExplicitMinLiq: false
+          });
+        }
+      }
+    }
+
     const sec = await this.security.checkToken(swap.chain, swap.tokenAddress);
     const symbol = snap?.symbol ?? swap.tokenSymbolHint ?? shortAddress(swap.tokenAddress);
 

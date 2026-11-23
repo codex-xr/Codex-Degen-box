@@ -1,5 +1,6 @@
 import { ChainKey, CHAINS, isChainKey, normalizeAddress } from "../chains/registry.js";
 import { AppConfig } from "../config.js";
+import { atomicToNumber } from "../utils/amounts.js";
 import { EvmClientManager } from "./evmClients.js";
 import { SolanaClientManager } from "./solanaClient.js";
 
@@ -189,8 +190,14 @@ export class MarketDataService {
     }
   }
 
-  private async fetchHeliusAssetPriceUsd(mint: string): Promise<number> {
-    if (!this.config.heliusApiKey) return 0;
+  private async fetchHeliusAssetMeta(mint: string): Promise<{
+    symbol: string;
+    name: string;
+    decimals: number | null;
+    supplyAtomic: number;
+    pricePerToken: number;
+  } | null> {
+    if (!this.config.heliusApiKey) return null;
     try {
       const res = await fetch(this.config.solanaRpcUrl, {
         method: "POST",
@@ -198,15 +205,41 @@ export class MarketDataService {
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getAsset", params: { id: mint } }),
         signal: AbortSignal.timeout(4000)
       });
-      if (!res.ok) return 0;
+      if (!res.ok) return null;
       const json = (await res.json()) as {
-        result?: { token_info?: { price_info?: { price_per_token?: number } } };
+        result?: {
+          content?: { metadata?: { symbol?: string; name?: string } };
+          token_info?: {
+            symbol?: string;
+            decimals?: number;
+            supply?: number;
+            price_info?: { price_per_token?: number };
+          };
+        };
       };
-      const price = Number(json.result?.token_info?.price_info?.price_per_token ?? 0);
-      return Number.isFinite(price) && price > 0 ? price : 0;
+      const r = json.result;
+      if (!r) return null;
+      const symbol = String(r.token_info?.symbol || r.content?.metadata?.symbol || "").trim();
+      const name = String(r.content?.metadata?.name || symbol || "").trim();
+      const decRaw = r.token_info?.decimals;
+      const decimals = typeof decRaw === "number" && Number.isInteger(decRaw) ? decRaw : null;
+      const supplyAtomic = Number(r.token_info?.supply ?? 0);
+      const pricePerToken = Number(r.token_info?.price_info?.price_per_token ?? 0);
+      return {
+        symbol,
+        name,
+        decimals,
+        supplyAtomic: Number.isFinite(supplyAtomic) && supplyAtomic > 0 ? supplyAtomic : 0,
+        pricePerToken: Number.isFinite(pricePerToken) && pricePerToken > 0 ? pricePerToken : 0
+      };
     } catch {
-      return 0;
+      return null;
     }
+  }
+
+  private async fetchHeliusAssetPriceUsd(mint: string): Promise<number> {
+    const meta = await this.fetchHeliusAssetMeta(mint);
+    return meta?.pricePerToken ?? 0;
   }
 
   private async fetchGeckoTerminalPriceUsd(network: string, address: string): Promise<number> {
@@ -278,8 +311,10 @@ export class MarketDataService {
       }
     }
 
-    const pairs = await this.fetchDexScreenerPairs(chain, trimmed);
-    if (pairs.length === 0) return [];
+    let pairs = await this.fetchDexScreenerPairs(chain, trimmed);
+    if (pairs.length === 0 && chain) {
+      pairs = await this.fetchDexScreenerPairs(null, trimmed);
+    }
 
     // Group best liquidity pair per supported chain
     const byChain = new Map<ChainKey, DexScreenerPair>();
@@ -309,7 +344,253 @@ export class MarketDataService {
       }
     }
 
+    if (snapshots.length === 0 && chain) {
+      const fallbackSnap =
+        (await this.fetchGeckoTerminalSnapshot(chain, trimmed)) ??
+        (chain === "solana" ? await this.fetchPumpFunSnapshot(trimmed) : null);
+      if (fallbackSnap) {
+        this.snapshotCache.set(`${chain}:${normalizeAddress(chain, fallbackSnap.address)}`, {
+          snap: fallbackSnap,
+          ts: Date.now()
+        });
+        snapshots.push(fallbackSnap);
+      }
+    }
+
     return snapshots.sort((a, b) => b.liquidityUsd - a.liquidityUsd);
+  }
+
+  private async fetchGeckoTerminalSnapshot(chain: ChainKey, address: string): Promise<TokenSnapshot | null> {
+    const gtNet = chain === "solana" ? "solana" : chain === "ethereum" ? "eth" : chain === "base" ? "base" : null;
+    if (!gtNet) return null;
+    const tokenPath = chain === "solana" ? address : address.toLowerCase();
+    try {
+      const res = await fetch(
+        `https://api.geckoterminal.com/api/v2/networks/${gtNet}/tokens/${tokenPath}/pools`,
+        { signal: AbortSignal.timeout(4500) }
+      );
+      if (!res.ok) return null;
+      const json = (await res.json()) as {
+        data?: Array<{
+          attributes?: {
+            address?: string;
+            name?: string;
+            base_token_price_usd?: string;
+            base_token_price_native_currency?: string;
+            fdv_usd?: string;
+            market_cap_usd?: string | null;
+            reserve_in_usd?: string;
+            pool_created_at?: string;
+            volume_usd?: { m5?: string; h1?: string; h24?: string };
+            price_change_percentage?: { m5?: string; h1?: string; h24?: string };
+            transactions?: { m5?: { buys?: number; sells?: number } };
+          };
+          relationships?: { dex?: { data?: { id?: string } } };
+        }>;
+      };
+      const pools = Array.isArray(json.data) ? json.data : [];
+      const best = pools
+        .filter((p) => Number(p.attributes?.base_token_price_usd ?? 0) > 0)
+        .sort((a, b) => Number(b.attributes?.reserve_in_usd ?? 0) - Number(a.attributes?.reserve_in_usd ?? 0))[0];
+      if (!best?.attributes) return null;
+
+      const attr = best.attributes;
+      const priceUsd = Number(attr.base_token_price_usd ?? 0);
+      if (!Number.isFinite(priceUsd) || priceUsd <= 0) return null;
+
+      const [nativePriceUsd, decimals, assetMeta] = await Promise.all([
+        this.getNativePriceUsd(chain),
+        chain === "solana"
+          ? this.solanaClient.getTokenDecimals(address)
+          : this.evmClients.getTokenDecimals(chain, address),
+        chain === "solana" ? this.fetchHeliusAssetMeta(address) : Promise.resolve(null)
+      ]);
+      const pairLabelSym = (attr.name ?? "").split("/")[0]?.trim() || "";
+      const symbol = assetMeta?.symbol || pairLabelSym || "UNKNOWN";
+      const name = assetMeta?.name || symbol;
+      const createdMs = attr.pool_created_at ? Date.parse(attr.pool_created_at) : NaN;
+      const pairCreatedAtMs = Number.isFinite(createdMs) && createdMs > 0 ? createdMs : null;
+      const now = Date.now();
+      const priceNative =
+        Number(attr.base_token_price_native_currency ?? 0) > 0
+          ? Number(attr.base_token_price_native_currency)
+          : nativePriceUsd > 0
+            ? priceUsd / nativePriceUsd
+            : 0;
+      const fdvUsd = Number(attr.fdv_usd ?? 0);
+      const mcUsd = Number(attr.market_cap_usd ?? fdvUsd ?? 0);
+
+      return {
+        chain,
+        address,
+        symbol,
+        name,
+        decimals: assetMeta?.decimals ?? decimals,
+        pairAddress: attr.address ?? address,
+        dex: best.relationships?.dex?.data?.id ?? "geckoterminal",
+        dexUrl: `https://www.geckoterminal.com/${gtNet}/pools/${attr.address ?? address}`,
+        priceUsd,
+        priceNative,
+        nativePriceUsd,
+        mcUsd: Number.isFinite(mcUsd) ? mcUsd : 0,
+        fdvUsd: Number.isFinite(fdvUsd) ? fdvUsd : 0,
+        liquidityUsd: Number(attr.reserve_in_usd ?? 0),
+        volume5mUsd: Number(attr.volume_usd?.m5 ?? 0),
+        volume1hUsd: Number(attr.volume_usd?.h1 ?? 0),
+        volume24hUsd: Number(attr.volume_usd?.h24 ?? 0),
+        txns5mBuys: Number(attr.transactions?.m5?.buys ?? 0),
+        txns5mSells: Number(attr.transactions?.m5?.sells ?? 0),
+        priceChange5m: Number(attr.price_change_percentage?.m5 ?? 0),
+        priceChange1h: Number(attr.price_change_percentage?.h1 ?? 0),
+        priceChange24h: Number(attr.price_change_percentage?.h24 ?? 0),
+        pairCreatedAtMs,
+        tokenAgeSec: pairCreatedAtMs ? Math.max(0, Math.floor((now - pairCreatedAtMs) / 1000)) : null,
+        imageUrl: null,
+        fetchedAt: now
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async fetchPumpFunSnapshot(mint: string): Promise<TokenSnapshot | null> {
+    try {
+      const res = await fetch(`https://frontend-api-v3.pump.fun/coins/${mint}`, {
+        signal: AbortSignal.timeout(4000)
+      });
+      if (!res.ok) return null;
+      const coin = (await res.json()) as {
+        mint?: string;
+        symbol?: string;
+        name?: string;
+        usd_market_cap?: number;
+        total_supply?: number;
+        virtual_sol_reserves?: number;
+        created_timestamp?: number;
+        image_uri?: string;
+        bonding_curve?: string;
+        raydium_pool?: string | null;
+      };
+      const mcUsd = Number(coin.usd_market_cap ?? 0);
+      const totalSupplyAtomic = Number(coin.total_supply ?? 0);
+      if (!coin.mint || !Number.isFinite(mcUsd) || mcUsd <= 0 || totalSupplyAtomic <= 0) return null;
+
+      const decimals = 6;
+      const supplyTokens = totalSupplyAtomic / 10 ** decimals;
+      const priceUsd = mcUsd / supplyTokens;
+      const nativePriceUsd = await this.getNativePriceUsd("solana");
+      if (!Number.isFinite(priceUsd) || priceUsd <= 0 || nativePriceUsd <= 0) return null;
+
+      const vSol = Number(coin.virtual_sol_reserves ?? 0) / 1e9;
+      const liquidityUsd = vSol > 0 ? vSol * 2 * nativePriceUsd : Math.min(25_000, Math.max(4_000, mcUsd * 0.5));
+      const now = Date.now();
+      const createdMs = coin.created_timestamp ? Number(coin.created_timestamp) : null;
+
+      return {
+        chain: "solana",
+        address: mint,
+        symbol: String(coin.symbol || "UNKNOWN").trim(),
+        name: String(coin.name || coin.symbol || "Pump Coin").trim(),
+        decimals,
+        pairAddress: coin.raydium_pool ?? coin.bonding_curve ?? mint,
+        dex: coin.raydium_pool ? "pumpswap" : "pumpfun",
+        dexUrl: `https://pump.fun/coin/${mint}`,
+        priceUsd,
+        priceNative: priceUsd / nativePriceUsd,
+        nativePriceUsd,
+        mcUsd,
+        fdvUsd: mcUsd,
+        liquidityUsd,
+        volume5mUsd: 0,
+        volume1hUsd: 0,
+        volume24hUsd: 0,
+        txns5mBuys: 0,
+        txns5mSells: 0,
+        priceChange5m: 0,
+        priceChange1h: 0,
+        priceChange24h: 0,
+        pairCreatedAtMs: createdMs,
+        tokenAgeSec: createdMs ? Math.max(0, Math.floor((now - createdMs) / 1000)) : null,
+        imageUrl: coin.image_uri ?? null,
+        fetchedAt: now
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Builds a live entry snapshot from Helius metadata + the watched wallet's verified on-chain swap fill
+   * when brand-new PumpSwap/DEX pools have not yet appeared in DexScreener or GeckoTerminal.
+   */
+  async buildOnChainSolanaSnapshot(params: {
+    tokenAddress: string;
+    walletNativeAmountAtomic: bigint | null;
+    walletTokenAmount?: number;
+    dex?: string;
+    hasExplicitMinLiq?: boolean;
+  }): Promise<TokenSnapshot | null> {
+    const [assetMeta, nativePriceUsd] = await Promise.all([
+      this.fetchHeliusAssetMeta(params.tokenAddress),
+      this.getNativePriceUsd("solana")
+    ]);
+    // Skip nameless raw LP position / vault receipt mints cleanly
+    if (!assetMeta || (!assetMeta.symbol && !assetMeta.name) || nativePriceUsd <= 0) {
+      return null;
+    }
+
+    const decimals = assetMeta.decimals ?? (await this.solanaClient.getTokenDecimals(params.tokenAddress));
+    let priceUsd = assetMeta.pricePerToken;
+    if (
+      priceUsd <= 0 &&
+      params.walletNativeAmountAtomic &&
+      params.walletNativeAmountAtomic >= 5_000_000n &&
+      params.walletTokenAmount &&
+      params.walletTokenAmount > 0
+    ) {
+      const nativeSpent = atomicToNumber(params.walletNativeAmountAtomic, CHAINS.solana.nativeDecimals);
+      priceUsd = (nativeSpent * nativePriceUsd) / params.walletTokenAmount;
+    }
+    if (!Number.isFinite(priceUsd) || priceUsd <= 0) return null;
+
+    const supplyTokens = assetMeta.supplyAtomic > 0 ? assetMeta.supplyAtomic / 10 ** decimals : 0;
+    const mcUsd = supplyTokens > 0 ? priceUsd * supplyTokens : 0;
+    if (mcUsd > 10_000_000_000) return null;
+
+    const liquidityUsd = params.hasExplicitMinLiq
+      ? 0
+      : Math.min(25_000, Math.max(8_000, mcUsd > 0 ? mcUsd * 0.5 : 12_000));
+    const now = Date.now();
+    const snap: TokenSnapshot = {
+      chain: "solana",
+      address: params.tokenAddress,
+      symbol: assetMeta.symbol || "UNKNOWN",
+      name: assetMeta.name || assetMeta.symbol || "Solana Token",
+      decimals,
+      pairAddress: params.tokenAddress,
+      dex: params.dex || "onchain",
+      dexUrl: `https://solscan.io/token/${params.tokenAddress}`,
+      priceUsd,
+      priceNative: priceUsd / nativePriceUsd,
+      nativePriceUsd,
+      mcUsd,
+      fdvUsd: mcUsd,
+      liquidityUsd,
+      volume5mUsd: 0,
+      volume1hUsd: 0,
+      volume24hUsd: 0,
+      txns5mBuys: 0,
+      txns5mSells: 0,
+      priceChange5m: 0,
+      priceChange1h: 0,
+      priceChange24h: 0,
+      pairCreatedAtMs: null,
+      tokenAgeSec: null,
+      imageUrl: null,
+      fetchedAt: now
+    };
+    this.snapshotCache.set(`solana:${params.tokenAddress}`, { snap, ts: now });
+    return snap;
   }
 
   async getTokenSnapshot(
@@ -371,6 +652,13 @@ export class MarketDataService {
       } catch {
         // Ignore transient batch error
       }
+    }
+
+    // Fallback to GeckoTerminal / Pump.fun / latest endpoint for any missing active tokens
+    const missing = toFetch.filter((addr) => !out.has(addr)).slice(0, 5);
+    for (const addr of missing) {
+      const snap = await this.getTokenSnapshot(chain, addr, 3500).catch(() => null);
+      if (snap) out.set(addr, snap);
     }
 
     return out;
