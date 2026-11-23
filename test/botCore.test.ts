@@ -861,3 +861,50 @@ test("walletWatcher HTTP server handles GET/HEAD health safely and routes /teleg
     }
   }
 });
+
+test("marketData recovers SOL and ETH USD prices via Helius, GeckoTerminal, and Chainlink when DexScreener and CoinGecko 429", async () => {
+  const tmp = makeTempDir("degen-price-");
+  const origFetch = globalThis.fetch;
+  try {
+    const config = loadConfig({ dataDir: tmp, heliusApiKey: "test_helius_key" });
+    const sol = new SolanaClientManager(config);
+    const mockEvm = {
+      getClient: (chain: string) => ({
+        readContract: async () =>
+          chain === "ethereum"
+            ? [1n, 7_425_000_000n, 0n, 0n, 1n] // $74.25 SOL/USD
+            : [1n, 176_500_000_000n, 0n, 0n, 1n] // $1765.00 ETH/USD
+      })
+    } as unknown as EvmClientManager;
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("dexscreener.com") || url.includes("coingecko.com")) {
+        return new Response(JSON.stringify({ error: "rate limited" }), { status: 429 });
+      }
+      if (url.includes("helius-rpc.com")) {
+        return new Response(
+          JSON.stringify({ result: { token_info: { price_info: { price_per_token: 74.5 } } } }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("geckoterminal.com")) {
+        return new Response(JSON.stringify({ error: "down" }), { status: 503 });
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const market = new MarketDataService(config, mockEvm, sol);
+    const [solUsd, ethUsd, baseEthUsd] = await Promise.all([
+      market.getNativePriceUsd("solana"),
+      market.getNativePriceUsd("ethereum"),
+      market.getNativePriceUsd("base")
+    ]);
+    assert.ok(solUsd > 70, `Expected SOL USD fallback > 70, got ${solUsd}`);
+    assert.equal(ethUsd, 1765);
+    assert.equal(baseEthUsd, 1765);
+  } finally {
+    globalThis.fetch = origFetch;
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+  }
+});

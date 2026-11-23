@@ -3,6 +3,42 @@ import { AppConfig } from "../config.js";
 import { EvmClientManager } from "./evmClients.js";
 import { SolanaClientManager } from "./solanaClient.js";
 
+const CHAINLINK_AGGREGATOR_ABI = [
+  {
+    type: "function",
+    name: "latestRoundData",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [
+      { name: "roundId", type: "uint80" },
+      { name: "answer", type: "int256" },
+      { name: "startedAt", type: "uint256" },
+      { name: "updatedAt", type: "uint256" },
+      { name: "answeredInRound", type: "uint80" }
+    ]
+  }
+] as const;
+
+const CHAINLINK_ETH_USD_BASE = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70" as const;
+const CHAINLINK_ETH_USD_ETH = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419" as const;
+const CHAINLINK_SOL_USD_ETH = "0x4ffC43a60e009B551865A93d232E33Fce9f01507" as const;
+
+async function firstPositivePrice(tasks: Array<() => Promise<number>>): Promise<number> {
+  try {
+    return await Promise.any(
+      tasks.map(async (fn) => {
+        const val = await fn();
+        if (!Number.isFinite(val) || val <= 0) {
+          throw new Error("Non-positive price");
+        }
+        return val;
+      })
+    );
+  } catch {
+    return 0;
+  }
+}
+
 export interface TokenSnapshot {
   chain: ChainKey;
   address: string;
@@ -71,6 +107,7 @@ export class MarketDataService {
   private readonly evmClients: EvmClientManager;
   private readonly solanaClient: SolanaClientManager;
   private readonly nativePriceCache = new Map<string, { price: number; ts: number }>();
+  private readonly pendingNativePrice = new Map<string, Promise<number>>();
   private readonly snapshotCache = new Map<string, { snap: TokenSnapshot; ts: number }>();
 
   constructor(
@@ -84,56 +121,146 @@ export class MarketDataService {
   }
 
   async getNativePriceUsd(chain: ChainKey): Promise<number> {
-    const assetKey = CHAINS[chain].nativeSymbol; // SOL or ETH
+    const assetKey = CHAINS[chain].nativeSymbol === "SOL" ? "SOL" : "ETH";
     const cached = this.nativePriceCache.get(assetKey);
-    if (cached && Date.now() - cached.ts < 15_000) {
+    if (cached && Date.now() - cached.ts < 20_000) {
       return cached.price;
     }
 
-    let price = 0;
+    const inflight = this.pendingNativePrice.get(assetKey);
+    if (inflight) return inflight;
+
+    const job = (async () => {
+      const price = await this.fetchNativePriceFresh(assetKey);
+      if (price > 0) {
+        this.nativePriceCache.set(assetKey, { price, ts: Date.now() });
+        return price;
+      }
+      return cached?.price ?? 0;
+    })().finally(() => {
+      this.pendingNativePrice.delete(assetKey);
+    });
+
+    this.pendingNativePrice.set(assetKey, job);
+    return job;
+  }
+
+  private async fetchNativePriceFresh(assetKey: "SOL" | "ETH"): Promise<number> {
+    const wrapped =
+      assetKey === "SOL"
+        ? CHAINS.solana.wrappedNativeAddress
+        : CHAINS.base.wrappedNativeAddress;
+    const dexChain = assetKey === "SOL" ? "solana" : "base";
+
+    const dexPrice = await this.fetchDexScreenerNativePrice(dexChain, wrapped);
+    if (dexPrice > 0) return dexPrice;
+
+    if (assetKey === "SOL") {
+      return firstPositivePrice([
+        () => this.fetchHeliusAssetPriceUsd(CHAINS.solana.wrappedNativeAddress),
+        () => this.fetchGeckoTerminalPriceUsd("solana", CHAINS.solana.wrappedNativeAddress),
+        () => this.fetchChainlinkUsd("ethereum", CHAINLINK_SOL_USD_ETH),
+        () => this.fetchCoinGeckoPriceUsd("solana")
+      ]);
+    }
+
+    return firstPositivePrice([
+      () => this.fetchChainlinkUsd("base", CHAINLINK_ETH_USD_BASE),
+      () => this.fetchChainlinkUsd("ethereum", CHAINLINK_ETH_USD_ETH),
+      () => this.fetchGeckoTerminalPriceUsd("eth", CHAINS.ethereum.wrappedNativeAddress),
+      () => this.fetchCoinGeckoPriceUsd("ethereum")
+    ]);
+  }
+
+  private async fetchDexScreenerNativePrice(dexChain: string, wrapped: string): Promise<number> {
     try {
-      const wrapped =
-        assetKey === "SOL"
-          ? CHAINS.solana.wrappedNativeAddress
-          : CHAINS.base.wrappedNativeAddress;
-      const dexChain = assetKey === "SOL" ? "solana" : "base";
       const res = await fetch(`https://api.dexscreener.com/tokens/v1/${dexChain}/${wrapped}`, {
-        signal: AbortSignal.timeout(6000)
+        signal: AbortSignal.timeout(4000)
       });
-      if (res.ok) {
-        const pairs = (await res.json()) as DexScreenerPair[];
-        const valid = pairs
-          .filter((p) => p.baseToken.address.toLowerCase() === wrapped.toLowerCase() && Number(p.priceUsd) > 0)
-          .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
-        if (valid[0]) {
-          price = Number(valid[0].priceUsd);
-        }
-      }
+      if (!res.ok) return 0;
+      const pairs = (await res.json()) as DexScreenerPair[];
+      if (!Array.isArray(pairs)) return 0;
+      const valid = pairs
+        .filter((p) => p?.baseToken?.address?.toLowerCase() === wrapped.toLowerCase() && Number(p.priceUsd) > 0)
+        .sort((a, b) => (b.liquidity?.usd ?? 0) - (a.liquidity?.usd ?? 0));
+      return valid[0] ? Number(valid[0].priceUsd) : 0;
     } catch {
-      // Fallback below
+      return 0;
     }
+  }
 
-    if (price <= 0) {
-      try {
-        const cgId = assetKey === "SOL" ? "solana" : "ethereum";
-        const res = await fetch(
-          `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd`,
-          { signal: AbortSignal.timeout(6000) }
-        );
-        if (res.ok) {
-          const data = (await res.json()) as Record<string, { usd?: number }>;
-          price = Number(data[cgId]?.usd ?? 0);
-        }
-      } catch {
-        // Fallback to last known cached value if transient outage
-      }
+  private async fetchHeliusAssetPriceUsd(mint: string): Promise<number> {
+    if (!this.config.heliusApiKey) return 0;
+    try {
+      const res = await fetch(this.config.solanaRpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getAsset", params: { id: mint } }),
+        signal: AbortSignal.timeout(4000)
+      });
+      if (!res.ok) return 0;
+      const json = (await res.json()) as {
+        result?: { token_info?: { price_info?: { price_per_token?: number } } };
+      };
+      const price = Number(json.result?.token_info?.price_info?.price_per_token ?? 0);
+      return Number.isFinite(price) && price > 0 ? price : 0;
+    } catch {
+      return 0;
     }
+  }
 
-    if (price > 0) {
-      this.nativePriceCache.set(assetKey, { price, ts: Date.now() });
-      return price;
+  private async fetchGeckoTerminalPriceUsd(network: string, address: string): Promise<number> {
+    try {
+      const tokenPath = network === "solana" ? address : address.toLowerCase();
+      const res = await fetch(
+        `https://api.geckoterminal.com/api/v2/simple/networks/${network}/token_price/${tokenPath}`,
+        { signal: AbortSignal.timeout(4000) }
+      );
+      if (!res.ok) return 0;
+      const json = (await res.json()) as {
+        data?: { attributes?: { token_prices?: Record<string, string> } };
+      };
+      const prices = json.data?.attributes?.token_prices ?? {};
+      const val = Number(prices[address] ?? prices[address.toLowerCase()] ?? Object.values(prices)[0] ?? 0);
+      return Number.isFinite(val) && val > 0 ? val : 0;
+    } catch {
+      return 0;
     }
-    return cached?.price ?? 0;
+  }
+
+  private async fetchCoinGeckoPriceUsd(cgId: string): Promise<number> {
+    try {
+      const res = await fetch(
+        `https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd`,
+        { signal: AbortSignal.timeout(4000) }
+      );
+      if (!res.ok) return 0;
+      const data = (await res.json()) as Record<string, { usd?: number }>;
+      const price = Number(data[cgId]?.usd ?? 0);
+      return Number.isFinite(price) && price > 0 ? price : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async fetchChainlinkUsd(chain: "ethereum" | "base", aggregatorAddress: `0x${string}`): Promise<number> {
+    try {
+      const client = this.evmClients.getClient(chain);
+      const round = await Promise.race([
+        client.readContract({
+          address: aggregatorAddress,
+          abi: CHAINLINK_AGGREGATOR_ABI,
+          functionName: "latestRoundData"
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Chainlink timeout")), 4000))
+      ]);
+      const answer = Array.isArray(round) ? BigInt(round[1]) : 0n;
+      if (answer <= 0n) return 0;
+      const price = Number(answer) / 1e8;
+      return Number.isFinite(price) && price > 0 ? price : 0;
+    } catch {
+      return 0;
+    }
   }
 
   async lookupToken(
@@ -224,6 +351,7 @@ export class MarketDataService {
         );
         if (!res.ok) continue;
         const pairs = (await res.json()) as DexScreenerPair[];
+        if (!Array.isArray(pairs)) continue;
         const bestByAddr = new Map<string, DexScreenerPair>();
         for (const p of pairs) {
           if (this.mapDexScreenerChain(p.chainId) !== chain) continue;
