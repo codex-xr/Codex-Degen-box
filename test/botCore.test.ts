@@ -87,14 +87,14 @@ test("exact decimal precision down to lowest unit (9 decimals SOL & 18 decimals 
   assert.throws(() => parseExactUnits("-5", 9), /Invalid amount/);
 });
 
-test("admin invite codes, max cabal user limit, and user isolation", () => {
+test("admin invite codes, max cabal user limit, and user isolation", async () => {
   const tmp = makeTempDir("degen-auth-");
   try {
     const adminDb = new AdminDb(path.join(tmp, "admin.db"), 2, "FIRSTADMIN");
     const vaults = new UserVaultManager(path.join(tmp, "users"));
 
     // Bootstrap first admin
-    const adminRes = adminDb.redeemCode({
+    const adminRes = await adminDb.redeemCode({
       code: "FIRSTADMIN",
       telegramId: "1001",
       username: "boss"
@@ -103,32 +103,32 @@ test("admin invite codes, max cabal user limit, and user isolation", () => {
     if (adminRes.ok) assert.equal(adminRes.user.role, "admin");
 
     // Admin generates single-use code
-    const code1 = adminDb.generateAccessCode({ createdBy: "1001", label: "Member1", maxUses: 1 });
-    const member1 = adminDb.redeemCode({ code: code1.code, telegramId: "1002", username: "m1" });
+    const code1 = await adminDb.generateAccessCode({ createdBy: "1001", label: "Member1", maxUses: 1 });
+    const member1 = await adminDb.redeemCode({ code: code1.code, telegramId: "1002", username: "m1" });
     assert.equal(member1.ok, true);
 
     // Same single-use code cannot be reused by a third user
-    const reuse = adminDb.redeemCode({ code: code1.code, telegramId: "1003" });
+    const reuse = await adminDb.redeemCode({ code: code1.code, telegramId: "1003" });
     assert.equal(reuse.ok, false);
 
     // Max cabal user limit (2) blocks new member when reached
-    const code2 = adminDb.generateAccessCode({ createdBy: "1001", label: "Member2", maxUses: 1 });
-    const blocked = adminDb.redeemCode({ code: code2.code, telegramId: "1003" });
+    const code2 = await adminDb.generateAccessCode({ createdBy: "1001", label: "Member2", maxUses: 1 });
+    const blocked = await adminDb.redeemCode({ code: code2.code, telegramId: "1003" });
     assert.equal(blocked.ok, false);
 
     // Private vault isolation check: separate DB files & separate funds
-    const v1 = vaults.getVault("1001");
-    const v2 = vaults.getVault("1002");
+    const v1 = await vaults.getVault("1001");
+    const v2 = await vaults.getVault("1002");
     assert.notEqual(v1.dbPath, v2.dbPath);
     assert.equal(fs.existsSync(v1.dbPath), true);
     assert.equal(fs.existsSync(v2.dbPath), true);
 
-    v1.setVirtualFunds("solana", parseExactUnits("50.123456789", 9));
-    assert.equal(v1.getBalance("solana").balanceAtomic, 50_123_456_789n);
-    assert.equal(v2.getBalance("solana").balanceAtomic, 0n);
+    await v1.setVirtualFunds("solana", parseExactUnits("50.123456789", 9));
+    assert.equal((await v1.getBalance("solana")).balanceAtomic, 50_123_456_789n);
+    assert.equal((await v2.getBalance("solana")).balanceAtomic, 0n);
 
-    vaults.closeAll();
-    adminDb.close();
+    await vaults.closeAll();
+    await adminDb.close();
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -145,9 +145,9 @@ test("trading engine handles exact lowest-decimal buys, partial/full sells, and 
     const sec = new SecurityService();
     const trading = new TradingEngine(market, sec);
 
-    const vault = vaults.getVault("777");
-    vault.setVirtualFunds("robinhood", parseExactUnits("1.000000000000000001", 18));
-    vault.setSetting("evm_gas_eth", "0");
+    const vault = await vaults.getVault("777");
+    await vault.setVirtualFunds("robinhood", parseExactUnits("1.000000000000000001", 18));
+    await vault.setSetting("evm_gas_eth", "0");
 
     // Buy on Robinhood Chain with custom exact Wei balance
     const entrySnap = makeFakeSnap({
@@ -172,7 +172,7 @@ test("trading engine handles exact lowest-decimal buys, partial/full sells, and 
     assert.equal(buyRes.side, "buy");
     assert.ok(buyRes.qtyTokenAtomic > 0n);
     assert.equal(
-      vault.getBalance("robinhood").balanceAtomic,
+      (await vault.getBalance("robinhood")).balanceAtomic,
       parseExactUnits("0.500000000000000001", 18)
     );
 
@@ -202,9 +202,9 @@ test("trading engine handles exact lowest-decimal buys, partial/full sells, and 
     });
     assert.equal(rugSell.side, "rug_writeoff");
     assert.equal(rugSell.positionClosed, true);
-    assert.equal(vault.getPositionById(buyRes.positionId)?.status, "rugged");
+    assert.equal((await vault.getPositionById(buyRes.positionId))?.status, "rugged");
 
-    vaults.closeAll();
+    await vaults.closeAll();
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -247,12 +247,12 @@ test("copy engine copies buys/sells with exact wallet attribution & generates we
       }
     });
 
-    const vault = vaults.getVault("555");
-    vault.setVirtualFunds("solana", parseExactUnits("10", 9));
-    vault.setSetting("sim_delay_ms", "0");
-    vault.setSetting("priority_fee_sol", "0");
+    const vault = await vaults.getVault("555");
+    await vault.setVirtualFunds("solana", parseExactUnits("10", 9));
+    await vault.setSetting("sim_delay_ms", "0");
+    await vault.setSetting("priority_fee_sol", "0");
 
-    const walletId = vault.addWatchedWallet({
+    const walletId = await vault.addWatchedWallet({
       chain: "solana",
       address: "WhaleWallet11111111111111111111111111111111",
       alias: "SniperWhale",
@@ -261,7 +261,7 @@ test("copy engine copies buys/sells with exact wallet attribution & generates we
       simMode: "ideal",
       mirrorSells: true
     });
-    const watched = vault.getWatchedWallet(walletId)!;
+    const watched = (await vault.getWatchedWallet(walletId))!;
 
     // Whale buys -> bot copies 2.5 SOL
     await copy.processSwapForUser("555", watched, {
@@ -275,8 +275,8 @@ test("copy engine copies buys/sells with exact wallet attribution & generates we
       detectedAt: Date.now() - 180_000
     });
 
-    assert.equal(vault.getBalance("solana").balanceAtomic, parseExactUnits("7.5", 9));
-    assert.equal(vault.listOpenPositions().length, 1);
+    assert.equal((await vault.getBalance("solana")).balanceAtomic, parseExactUnits("7.5", 9));
+    assert.equal((await vault.listOpenPositions()).length, 1);
 
     // Token pumps 3x, whale sells -> bot mirrors sell
     currentPrice = 0.003;
@@ -292,8 +292,8 @@ test("copy engine copies buys/sells with exact wallet attribution & generates we
       detectedAt: Date.now()
     });
 
-    assert.equal(vault.listOpenPositions().length, 0);
-    assert.ok(vault.getBalance("solana").balanceAtomic > parseExactUnits("14", 9));
+    assert.equal((await vault.listOpenPositions()).length, 0);
+    assert.ok((await vault.getBalance("solana")).balanceAtomic > parseExactUnits("14", 9));
     assert.equal(notifications.length, 2);
 
     // Weekly intelligence report picks up SniperWhale as top earner + MC/age buckets
@@ -305,8 +305,8 @@ test("copy engine copies buys/sells with exact wallet attribution & generates we
     assert.match(formattedText, /SniperWhale/);
     assert.match(formattedText, /Pattern Recognition/);
 
-    vaults.closeAll();
-    adminDb.close();
+    await vaults.closeAll();
+    await adminDb.close();
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

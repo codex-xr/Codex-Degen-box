@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: codex-degen-box
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_TELEGRAM_IDS
+        value: "6686703329"
+      - key: MAX_CABAL_USERS
+        value: "10"

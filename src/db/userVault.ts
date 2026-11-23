@@ -2,190 +2,39 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { CHAIN_LIST, ChainKey, CHAINS, normalizeAddress } from "../chains/registry.js";
-
-export type SimMode = "realistic" | "ideal";
-export type PnlTheme = "cyber" | "solana" | "robinhood" | "gold";
-export type CopyMode = "fixed" | "percent_balance";
-
-export interface VirtualBalanceRow {
-  chain: ChainKey;
-  balanceAtomic: bigint;
-  initialBalanceAtomic: bigint;
-  updatedAt: number;
-}
-
-export interface UserSettings {
-  activeChain: ChainKey;
-  slippageBps: number;
-  priorityFeeSol: string;
-  evmGasEth: string;
-  simMode: SimMode;
-  simDelayMs: number;
-  pnlTheme: PnlTheme;
-  weeklyReportEnabled: boolean;
-  copyNotify: boolean;
-}
-
-export interface PositionRow {
-  id: number;
-  chain: ChainKey;
-  tokenAddress: string;
-  tokenSymbol: string;
-  tokenName: string;
-  tokenDecimals: number;
-  pairAddress: string | null;
-  dex: string | null;
-  sourceType: "manual" | "copy" | "limit" | "dca";
-  copiedWalletId: number | null;
-  status: "open" | "closed" | "rugged";
-  qtyTokenAtomic: bigint;
-  initialQtyTokenAtomic: bigint;
-  costNativeAtomic: bigint;
-  initialCostNativeAtomic: bigint;
-  realizedNativeAtomic: bigint;
-  costUsd: number;
-  initialCostUsd: number;
-  realizedUsd: number;
-  entryPriceUsd: number;
-  lastPriceUsd: number;
-  entryMcUsd: number;
-  entryLiqUsd: number;
-  entryVol5mUsd: number;
-  entryTokenAgeSec: number | null;
-  peakPriceUsd: number;
-  peakMcUsd: number;
-  exitPriceUsd: number | null;
-  exitMcUsd: number | null;
-  openedAt: number;
-  closedAt: number | null;
-}
-
-export interface TradeRow {
-  id: number;
-  positionId: number;
-  chain: ChainKey;
-  side: "buy" | "sell" | "rug_writeoff";
-  sourceType: string;
-  copiedWalletId: number | null;
-  copiedTxHash: string | null;
-  tokenAddress: string;
-  tokenSymbol: string;
-  qtyTokenAtomic: bigint;
-  nativeAmountAtomic: bigint;
-  feeNativeAtomic: bigint;
-  taxBps: number;
-  slippageBps: number;
-  priceUsd: number;
-  nativePriceUsd: number;
-  mcUsd: number;
-  liqUsd: number;
-  vol5mUsd: number;
-  tokenAgeSec: number | null;
-  securityRisk: string;
-  realizedPnlNativeAtomic: bigint;
-  realizedPnlUsd: number;
-  simDelayMs: number;
-  executedAt: number;
-}
-
-export interface OrderRow {
-  id: number;
-  chain: ChainKey;
-  tokenAddress: string;
-  tokenSymbol: string;
-  positionId: number | null;
-  orderType: "limit_buy" | "tp" | "sl" | "trailing_stop" | "dca";
-  triggerMcUsd: number | null;
-  triggerPriceUsd: number | null;
-  triggerPnlPct: number | null;
-  trailingDropPct: number | null;
-  highestPriceUsd: number | null;
-  amountNativeAtomic: bigint | null;
-  sellPct: number | null;
-  dcaIntervalSec: number | null;
-  dcaRemaining: number | null;
-  nextRunAt: number | null;
-  status: "active" | "filled" | "cancelled";
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface WatchedWalletRow {
-  id: number;
-  chain: ChainKey;
-  address: string;
-  alias: string;
-  enabled: boolean;
-  copyMode: CopyMode;
-  copyAmountAtomic: bigint;
-  copyPercent: number;
-  maxBuyAtomic: bigint | null;
-  minMcUsd: number | null;
-  maxMcUsd: number | null;
-  minLiqUsd: number | null;
-  skipIfHeld: boolean;
-  mirrorSells: boolean;
-  blockRisky: boolean;
-  simMode: SimMode;
-  autoTpPct: number | null;
-  autoSlPct: number | null;
-  lastSeenTx: string | null;
-  createdAt: number;
-}
-
-export interface ObservedSwapRow {
-  id: number;
-  watchedWalletId: number;
-  chain: ChainKey;
-  txHash: string;
-  side: "buy" | "sell";
-  tokenAddress: string;
-  tokenSymbol: string | null;
-  walletNativeAmountAtomic: bigint | null;
-  priceUsdAtEvent: number | null;
-  mcUsdAtEvent: number | null;
-  liqUsdAtEvent: number | null;
-  vol5mUsdAtEvent: number | null;
-  tokenAgeSec: number | null;
-  dex: string | null;
-  actionTaken: string;
-  skipReason: string | null;
-  observedAt: number;
-}
-
-export interface WeeklyReportRow {
-  id: number;
-  periodStart: number;
-  periodEnd: number;
-  summaryJson: string;
-  reportText: string;
-  createdAt: number;
-}
-
-const DEFAULT_SETTINGS: UserSettings = {
-  activeChain: "solana",
-  slippageBps: 1500, // 15% degen default
-  priorityFeeSol: "0.001",
-  evmGasEth: "0.00005",
-  simMode: "realistic",
-  simDelayMs: 1500,
-  pnlTheme: "cyber",
-  weeklyReportEnabled: true,
-  copyNotify: true
-};
+import {
+  CopyMode,
+  DEFAULT_USER_SETTINGS,
+  IUserVault,
+  IVaultManager,
+  ObservedSwapRow,
+  OrderRow,
+  PnlTheme,
+  PositionRow,
+  SimMode,
+  TradeRow,
+  UserSettings,
+  VirtualBalanceRow,
+  WatchedWalletRow,
+  WeeklyReportRow
+} from "./types.js";
+export * from "./types.js";
 
 /**
- * Isolated per-user private database (`data/users/<telegramId>.db`).
- * Every single user has their own standalone SQLite file with zero shared tables.
+ * Isolated per-user private SQLite database (`data/users/<telegramId>.db`).
+ * Used automatically when running locally without DATABASE_URL.
  */
-export class UserVault {
+export class UserVault implements IUserVault {
   readonly telegramId: string;
   readonly dbPath: string;
+  readonly locationLabel: string;
   private readonly db: DatabaseSync;
+  private inTx = false;
 
   constructor(telegramId: string, dbPath: string) {
     this.telegramId = telegramId;
     this.dbPath = dbPath;
+    this.locationLabel = dbPath;
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL;");
@@ -366,15 +215,15 @@ export class UserVault {
     }
 
     const defaults: Record<string, string> = {
-      active_chain: DEFAULT_SETTINGS.activeChain,
-      slippage_bps: String(DEFAULT_SETTINGS.slippageBps),
-      priority_fee_sol: DEFAULT_SETTINGS.priorityFeeSol,
-      evm_gas_eth: DEFAULT_SETTINGS.evmGasEth,
-      sim_mode: DEFAULT_SETTINGS.simMode,
-      sim_delay_ms: String(DEFAULT_SETTINGS.simDelayMs),
-      pnl_theme: DEFAULT_SETTINGS.pnlTheme,
-      weekly_report_enabled: DEFAULT_SETTINGS.weeklyReportEnabled ? "1" : "0",
-      copy_notify: DEFAULT_SETTINGS.copyNotify ? "1" : "0"
+      active_chain: DEFAULT_USER_SETTINGS.activeChain,
+      slippage_bps: String(DEFAULT_USER_SETTINGS.slippageBps),
+      priority_fee_sol: DEFAULT_USER_SETTINGS.priorityFeeSol,
+      evm_gas_eth: DEFAULT_USER_SETTINGS.evmGasEth,
+      sim_mode: DEFAULT_USER_SETTINGS.simMode,
+      sim_delay_ms: String(DEFAULT_USER_SETTINGS.simDelayMs),
+      pnl_theme: DEFAULT_USER_SETTINGS.pnlTheme,
+      weekly_report_enabled: DEFAULT_USER_SETTINGS.weeklyReportEnabled ? "1" : "0",
+      copy_notify: DEFAULT_USER_SETTINGS.copyNotify ? "1" : "0"
     };
     const insertSetting = this.db.prepare(
       `INSERT OR IGNORE INTO user_settings (key, value) VALUES (?, ?)`
@@ -384,25 +233,27 @@ export class UserVault {
     }
   }
 
-  close(): void {
+  async close(): Promise<void> {
     this.db.close();
   }
 
-  runInTransaction<T>(fn: () => T): T {
+  async runInTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.inTx) return fn();
+    this.inTx = true;
     this.db.exec("BEGIN IMMEDIATE;");
     try {
-      const result = fn();
+      const result = await fn();
       this.db.exec("COMMIT;");
       return result;
     } catch (err) {
       this.db.exec("ROLLBACK;");
       throw err;
+    } finally {
+      this.inTx = false;
     }
   }
 
-  // === Virtual Balances ===
-
-  getBalances(): VirtualBalanceRow[] {
+  async getBalances(): Promise<VirtualBalanceRow[]> {
     const rows = this.db
       .prepare(`SELECT * FROM virtual_balances`)
       .all() as Array<Record<string, unknown>>;
@@ -414,7 +265,7 @@ export class UserVault {
     }));
   }
 
-  getBalance(chain: ChainKey): VirtualBalanceRow {
+  async getBalance(chain: ChainKey): Promise<VirtualBalanceRow> {
     const row = this.db
       .prepare(`SELECT * FROM virtual_balances WHERE chain = ?`)
       .get(chain) as Record<string, unknown>;
@@ -426,7 +277,7 @@ export class UserVault {
     };
   }
 
-  setVirtualFunds(chain: ChainKey, newBalanceAtomic: bigint, resetInitial = true): void {
+  async setVirtualFunds(chain: ChainKey, newBalanceAtomic: bigint, resetInitial = true): Promise<void> {
     if (newBalanceAtomic < 0n) throw new Error("Balance cannot be negative.");
     const now = Date.now();
     if (resetInitial) {
@@ -444,37 +295,35 @@ export class UserVault {
     }
   }
 
-  adjustBalance(chain: ChainKey, deltaAtomic: bigint): bigint {
-    const current = this.getBalance(chain).balanceAtomic;
+  async adjustBalance(chain: ChainKey, deltaAtomic: bigint): Promise<bigint> {
+    const current = (await this.getBalance(chain)).balanceAtomic;
     const next = current + deltaAtomic;
     if (next < 0n) {
       throw new Error(`Insufficient virtual ${CHAINS[chain].nativeSymbol} balance.`);
     }
-    this.setVirtualFunds(chain, next, false);
+    await this.setVirtualFunds(chain, next, false);
     return next;
   }
 
-  // === Settings ===
-
-  getSettings(): UserSettings {
+  async getSettings(): Promise<UserSettings> {
     const rows = this.db
       .prepare(`SELECT key, value FROM user_settings`)
       .all() as Array<{ key: string; value: string }>;
     const map = new Map(rows.map((r) => [r.key, r.value]));
     return {
-      activeChain: (map.get("active_chain") as ChainKey) ?? DEFAULT_SETTINGS.activeChain,
-      slippageBps: Number(map.get("slippage_bps") ?? DEFAULT_SETTINGS.slippageBps),
-      priorityFeeSol: map.get("priority_fee_sol") ?? DEFAULT_SETTINGS.priorityFeeSol,
-      evmGasEth: map.get("evm_gas_eth") ?? DEFAULT_SETTINGS.evmGasEth,
-      simMode: (map.get("sim_mode") as SimMode) ?? DEFAULT_SETTINGS.simMode,
-      simDelayMs: Number(map.get("sim_delay_ms") ?? DEFAULT_SETTINGS.simDelayMs),
-      pnlTheme: (map.get("pnl_theme") as PnlTheme) ?? DEFAULT_SETTINGS.pnlTheme,
+      activeChain: (map.get("active_chain") as ChainKey) ?? DEFAULT_USER_SETTINGS.activeChain,
+      slippageBps: Number(map.get("slippage_bps") ?? DEFAULT_USER_SETTINGS.slippageBps),
+      priorityFeeSol: map.get("priority_fee_sol") ?? DEFAULT_USER_SETTINGS.priorityFeeSol,
+      evmGasEth: map.get("evm_gas_eth") ?? DEFAULT_USER_SETTINGS.evmGasEth,
+      simMode: (map.get("sim_mode") as SimMode) ?? DEFAULT_USER_SETTINGS.simMode,
+      simDelayMs: Number(map.get("sim_delay_ms") ?? DEFAULT_USER_SETTINGS.simDelayMs),
+      pnlTheme: (map.get("pnl_theme") as PnlTheme) ?? DEFAULT_USER_SETTINGS.pnlTheme,
       weeklyReportEnabled: (map.get("weekly_report_enabled") ?? "1") === "1",
       copyNotify: (map.get("copy_notify") ?? "1") === "1"
     };
   }
 
-  setSetting(key: string, value: string): void {
+  async setSetting(key: string, value: string): Promise<void> {
     this.db
       .prepare(
         `INSERT INTO user_settings (key, value) VALUES (?, ?)
@@ -483,9 +332,11 @@ export class UserVault {
       .run(key, value);
   }
 
-  // === Positions ===
-
-  getOpenPosition(chain: ChainKey, tokenAddress: string, copiedWalletId?: number | null): PositionRow | null {
+  async getOpenPosition(
+    chain: ChainKey,
+    tokenAddress: string,
+    copiedWalletId?: number | null
+  ): Promise<PositionRow | null> {
     const norm = normalizeAddress(chain, tokenAddress);
     const row =
       copiedWalletId !== undefined && copiedWalletId !== null
@@ -506,14 +357,14 @@ export class UserVault {
     return row ? this.mapPosition(row) : null;
   }
 
-  getPositionById(id: number): PositionRow | null {
+  async getPositionById(id: number): Promise<PositionRow | null> {
     const row = this.db
       .prepare(`SELECT * FROM positions WHERE id = ?`)
       .get(id) as Record<string, unknown> | undefined;
     return row ? this.mapPosition(row) : null;
   }
 
-  listOpenPositions(chain?: ChainKey): PositionRow[] {
+  async listOpenPositions(chain?: ChainKey): Promise<PositionRow[]> {
     const rows = chain
       ? (this.db
           .prepare(`SELECT * FROM positions WHERE status = 'open' AND chain = ? ORDER BY opened_at DESC`)
@@ -524,33 +375,14 @@ export class UserVault {
     return rows.map((r) => this.mapPosition(r));
   }
 
-  listClosedPositions(limit = 20): PositionRow[] {
+  async listClosedPositions(limit = 20): Promise<PositionRow[]> {
     const rows = this.db
       .prepare(`SELECT * FROM positions WHERE status != 'open' ORDER BY closed_at DESC LIMIT ?`)
       .all(limit) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapPosition(r));
   }
 
-  createPosition(input: {
-    chain: ChainKey;
-    tokenAddress: string;
-    tokenSymbol: string;
-    tokenName: string;
-    tokenDecimals: number;
-    pairAddress: string | null;
-    dex: string | null;
-    sourceType: "manual" | "copy" | "limit" | "dca";
-    copiedWalletId: number | null;
-    qtyTokenAtomic: bigint;
-    costNativeAtomic: bigint;
-    costUsd: number;
-    entryPriceUsd: number;
-    entryMcUsd: number;
-    entryLiqUsd: number;
-    entryVol5mUsd: number;
-    entryTokenAgeSec: number | null;
-    openedAt: number;
-  }): number {
+  async createPosition(input: Parameters<IUserVault["createPosition"]>[0]): Promise<number> {
     const norm = normalizeAddress(input.chain, input.tokenAddress);
     const res = this.db
       .prepare(
@@ -592,15 +424,8 @@ export class UserVault {
     return Number(res.lastInsertRowid);
   }
 
-  addToPosition(params: {
-    id: number;
-    addedTokensAtomic: bigint;
-    addedNativeAtomic: bigint;
-    addedCostUsd: number;
-    newPriceUsd: number;
-    newMcUsd: number;
-  }): void {
-    const pos = this.getPositionById(params.id);
+  async addToPosition(params: Parameters<IUserVault["addToPosition"]>[0]): Promise<void> {
+    const pos = await this.getPositionById(params.id);
     if (!pos) throw new Error("Position not found");
 
     const nextQty = pos.qtyTokenAtomic + params.addedTokensAtomic;
@@ -639,17 +464,10 @@ export class UserVault {
       );
   }
 
-  reduceOrClosePosition(params: {
-    id: number;
-    soldTokensAtomic: bigint;
-    receivedNativeAtomic: bigint;
-    receivedUsd: number;
-    priceUsd: number;
-    mcUsd: number;
-    statusIfZero?: "closed" | "rugged";
-    closedAt: number;
-  }): { closed: boolean; costBasisSoldNative: bigint; costBasisSoldUsd: number } {
-    const pos = this.getPositionById(params.id);
+  async reduceOrClosePosition(
+    params: Parameters<IUserVault["reduceOrClosePosition"]>[0]
+  ): Promise<{ closed: boolean; costBasisSoldNative: bigint; costBasisSoldUsd: number }> {
+    const pos = await this.getPositionById(params.id);
     if (!pos) throw new Error("Position not found");
     if (params.soldTokensAtomic > pos.qtyTokenAtomic) {
       throw new Error("Cannot sell more tokens than held.");
@@ -695,7 +513,7 @@ export class UserVault {
     return { closed: isClosed, costBasisSoldNative, costBasisSoldUsd };
   }
 
-  updatePositionMark(id: number, lastPriceUsd: number, mcUsd: number): void {
+  async updatePositionMark(id: number, lastPriceUsd: number, mcUsd: number): Promise<void> {
     this.db
       .prepare(
         `UPDATE positions SET
@@ -707,9 +525,7 @@ export class UserVault {
       .run(lastPriceUsd, lastPriceUsd, mcUsd, id);
   }
 
-  // === Trades ===
-
-  recordTrade(input: Omit<TradeRow, "id">): number {
+  async recordTrade(input: Omit<TradeRow, "id">): Promise<number> {
     const res = this.db
       .prepare(
         `INSERT INTO trades (
@@ -749,21 +565,21 @@ export class UserVault {
     return Number(res.lastInsertRowid);
   }
 
-  listTradesBetween(startMs: number, endMs: number): TradeRow[] {
+  async listTradesBetween(startMs: number, endMs: number): Promise<TradeRow[]> {
     const rows = this.db
       .prepare(`SELECT * FROM trades WHERE executed_at >= ? AND executed_at <= ? ORDER BY executed_at ASC`)
       .all(startMs, endMs) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapTrade(r));
   }
 
-  listRecentTrades(limit = 20): TradeRow[] {
+  async listRecentTrades(limit = 20): Promise<TradeRow[]> {
     const rows = this.db
       .prepare(`SELECT * FROM trades ORDER BY executed_at DESC LIMIT ?`)
       .all(limit) as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapTrade(r));
   }
 
-  listPositionsInPeriod(startMs: number, endMs: number): PositionRow[] {
+  async listPositionsInPeriod(startMs: number, endMs: number): Promise<PositionRow[]> {
     const rows = this.db
       .prepare(
         `SELECT * FROM positions
@@ -775,9 +591,7 @@ export class UserVault {
     return rows.map((r) => this.mapPosition(r));
   }
 
-  // === Orders ===
-
-  createOrder(input: Omit<OrderRow, "id" | "createdAt" | "updatedAt" | "status">): number {
+  async createOrder(input: Omit<OrderRow, "id" | "createdAt" | "updatedAt" | "status">): Promise<number> {
     const now = Date.now();
     const res = this.db
       .prepare(
@@ -810,7 +624,7 @@ export class UserVault {
     return Number(res.lastInsertRowid);
   }
 
-  listActiveOrders(chain?: ChainKey): OrderRow[] {
+  async listActiveOrders(chain?: ChainKey): Promise<OrderRow[]> {
     const rows = chain
       ? (this.db
           .prepare(`SELECT * FROM orders WHERE status = 'active' AND chain = ? ORDER BY created_at DESC`)
@@ -821,46 +635,27 @@ export class UserVault {
     return rows.map((r) => this.mapOrder(r));
   }
 
-  updateOrderHighestPrice(id: number, highestPriceUsd: number): void {
+  async updateOrderHighestPrice(id: number, highestPriceUsd: number): Promise<void> {
     this.db
       .prepare(`UPDATE orders SET highest_price_usd = ?, updated_at = ? WHERE id = ?`)
       .run(highestPriceUsd, Date.now(), id);
   }
 
-  advanceDcaOrder(id: number, remaining: number, nextRunAt: number | null): void {
+  async advanceDcaOrder(id: number, remaining: number, nextRunAt: number | null): Promise<void> {
     const status = remaining <= 0 ? "filled" : "active";
     this.db
       .prepare(`UPDATE orders SET dca_remaining = ?, next_run_at = ?, status = ?, updated_at = ? WHERE id = ?`)
       .run(remaining, nextRunAt, status, Date.now(), id);
   }
 
-  setOrderStatus(id: number, status: "active" | "filled" | "cancelled"): boolean {
+  async setOrderStatus(id: number, status: "active" | "filled" | "cancelled"): Promise<boolean> {
     const res = this.db
       .prepare(`UPDATE orders SET status = ?, updated_at = ? WHERE id = ?`)
       .run(status, Date.now(), id);
     return Number(res.changes) > 0;
   }
 
-  // === Watched Wallets ===
-
-  addWatchedWallet(input: {
-    chain: ChainKey;
-    address: string;
-    alias: string;
-    copyMode: CopyMode;
-    copyAmountAtomic: bigint;
-    copyPercent?: number;
-    maxBuyAtomic?: bigint | null;
-    minMcUsd?: number | null;
-    maxMcUsd?: number | null;
-    minLiqUsd?: number | null;
-    skipIfHeld?: boolean;
-    mirrorSells?: boolean;
-    blockRisky?: boolean;
-    simMode?: SimMode;
-    autoTpPct?: number | null;
-    autoSlPct?: number | null;
-  }): number {
+  async addWatchedWallet(input: Parameters<IUserVault["addWatchedWallet"]>[0]): Promise<number> {
     const norm = normalizeAddress(input.chain, input.address);
     const now = Date.now();
     const res = this.db
@@ -893,7 +688,7 @@ export class UserVault {
     return Number(res.lastInsertRowid);
   }
 
-  listWatchedWallets(onlyEnabled = false): WatchedWalletRow[] {
+  async listWatchedWallets(onlyEnabled = false): Promise<WatchedWalletRow[]> {
     const rows = onlyEnabled
       ? (this.db
           .prepare(`SELECT * FROM watched_wallets WHERE enabled = 1 ORDER BY id ASC`)
@@ -904,35 +699,18 @@ export class UserVault {
     return rows.map((r) => this.mapWatchedWallet(r));
   }
 
-  getWatchedWallet(id: number): WatchedWalletRow | null {
+  async getWatchedWallet(id: number): Promise<WatchedWalletRow | null> {
     const row = this.db
       .prepare(`SELECT * FROM watched_wallets WHERE id = ?`)
       .get(id) as Record<string, unknown> | undefined;
     return row ? this.mapWatchedWallet(row) : null;
   }
 
-  updateWatchedWallet(
+  async updateWatchedWallet(
     id: number,
-    patch: Partial<{
-      alias: string;
-      enabled: boolean;
-      copyMode: CopyMode;
-      copyAmountAtomic: bigint;
-      copyPercent: number;
-      maxBuyAtomic: bigint | null;
-      minMcUsd: number | null;
-      maxMcUsd: number | null;
-      minLiqUsd: number | null;
-      skipIfHeld: boolean;
-      mirrorSells: boolean;
-      blockRisky: boolean;
-      simMode: SimMode;
-      autoTpPct: number | null;
-      autoSlPct: number | null;
-      lastSeenTx: string | null;
-    }>
-  ): void {
-    const current = this.getWatchedWallet(id);
+    patch: Parameters<IUserVault["updateWatchedWallet"]>[1]
+  ): Promise<void> {
+    const current = await this.getWatchedWallet(id);
     if (!current) return;
     this.db
       .prepare(
@@ -964,14 +742,12 @@ export class UserVault {
       );
   }
 
-  deleteWatchedWallet(id: number): boolean {
+  async deleteWatchedWallet(id: number): Promise<boolean> {
     const res = this.db.prepare(`DELETE FROM watched_wallets WHERE id = ?`).run(id);
     return Number(res.changes) > 0;
   }
 
-  // === Observed Swaps ===
-
-  recordObservedSwap(input: Omit<ObservedSwapRow, "id">): boolean {
+  async recordObservedSwap(input: Omit<ObservedSwapRow, "id">): Promise<boolean> {
     const res = this.db
       .prepare(
         `INSERT OR IGNORE INTO observed_wallet_swaps (
@@ -1001,7 +777,7 @@ export class UserVault {
     return Number(res.changes) > 0;
   }
 
-  listObservedSwapsBetween(startMs: number, endMs: number): ObservedSwapRow[] {
+  async listObservedSwapsBetween(startMs: number, endMs: number): Promise<ObservedSwapRow[]> {
     const rows = this.db
       .prepare(
         `SELECT * FROM observed_wallet_swaps
@@ -1012,9 +788,7 @@ export class UserVault {
     return rows.map((r) => this.mapObservedSwap(r));
   }
 
-  // === Weekly Reports ===
-
-  saveWeeklyReport(input: Omit<WeeklyReportRow, "id" | "createdAt">): number {
+  async saveWeeklyReport(input: Omit<WeeklyReportRow, "id" | "createdAt">): Promise<number> {
     const res = this.db
       .prepare(
         `INSERT INTO weekly_reports (period_start, period_end, summary_json, report_text, created_at)
@@ -1024,7 +798,7 @@ export class UserVault {
     return Number(res.lastInsertRowid);
   }
 
-  getLatestWeeklyReport(): WeeklyReportRow | null {
+  async getLatestWeeklyReport(): Promise<WeeklyReportRow | null> {
     const row = this.db
       .prepare(`SELECT * FROM weekly_reports ORDER BY created_at DESC LIMIT 1`)
       .get() as Record<string, unknown> | undefined;
@@ -1038,8 +812,6 @@ export class UserVault {
       createdAt: Number(row.created_at)
     };
   }
-
-  // === Mappers ===
 
   private mapPosition(row: Record<string, unknown>): PositionRow {
     return {
@@ -1181,7 +953,7 @@ export class UserVault {
   }
 }
 
-export class UserVaultManager {
+export class UserVaultManager implements IVaultManager {
   private readonly vaultDir: string;
   private readonly vaults = new Map<string, UserVault>();
 
@@ -1190,7 +962,7 @@ export class UserVaultManager {
     fs.mkdirSync(vaultDir, { recursive: true });
   }
 
-  getVault(telegramId: string): UserVault {
+  async getVault(telegramId: string): Promise<UserVault> {
     if (!/^\d+$/.test(telegramId)) {
       throw new Error(`Invalid Telegram ID "${telegramId}"`);
     }
@@ -1203,14 +975,14 @@ export class UserVaultManager {
     return vault;
   }
 
-  hasVault(telegramId: string): boolean {
+  async hasVault(telegramId: string): Promise<boolean> {
     if (!/^\d+$/.test(telegramId)) return false;
     return fs.existsSync(path.join(this.vaultDir, `${telegramId}.db`));
   }
 
-  closeAll(): void {
+  async closeAll(): Promise<void> {
     for (const v of this.vaults.values()) {
-      v.close();
+      await v.close();
     }
     this.vaults.clear();
   }

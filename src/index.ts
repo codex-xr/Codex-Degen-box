@@ -2,6 +2,12 @@ import { InputFile } from "grammy";
 import { loadConfig } from "./config.js";
 import { AdminDb } from "./db/adminDb.js";
 import { UserVaultManager } from "./db/userVault.js";
+import {
+  createPgPool,
+  PostgresAdminDb,
+  PostgresVaultManager
+} from "./db/postgresStore.js";
+import { IAdminDb, IVaultManager } from "./db/types.js";
 import { createTelegramBot } from "./bot/telegramBot.js";
 import { CopyEngine } from "./services/copyEngine.js";
 import { EvmClientManager } from "./services/evmClients.js";
@@ -22,10 +28,26 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const adminDb = new AdminDb(config.adminDbPath, config.maxCabalUsers, config.adminBootstrapCode);
-  adminDb.ensureAdminsFromConfig(config.adminTelegramIds);
+  let adminDb: IAdminDb;
+  let vaultManager: IVaultManager;
+  let closePgPool: (() => Promise<void>) | null = null;
 
-  const vaultManager = new UserVaultManager(config.userVaultDir);
+  if (config.databaseUrl) {
+    const pool = createPgPool(config.databaseUrl);
+    const pgAdmin = new PostgresAdminDb(pool, config.maxCabalUsers, config.adminBootstrapCode);
+    await pgAdmin.init();
+    adminDb = pgAdmin;
+    vaultManager = new PostgresVaultManager(pool);
+    closePgPool = () => pool.end();
+    console.log("Storage mode: Supabase / Postgres (private per-user schemas)");
+  } else {
+    adminDb = new AdminDb(config.adminDbPath, config.maxCabalUsers, config.adminBootstrapCode);
+    vaultManager = new UserVaultManager(config.userVaultDir);
+    console.log("Storage mode: Local SQLite (private per-user .db files)");
+  }
+
+  await adminDb.ensureAdminsFromConfig(config.adminTelegramIds);
+
   const evmClients = new EvmClientManager(config);
   const solanaClient = new SolanaClientManager(config);
   const market = new MarketDataService(config, evmClients, solanaClient);
@@ -52,15 +74,16 @@ async function main(): Promise<void> {
     // Automatically deliver a PNG PnL Card whenever a position closes on sell/TP/SL/copy-sell
     if (result && result.positionClosed && result.side !== "buy") {
       try {
-        const vault = vaultManager.getVault(telegramId);
-        const pos = vault.getPositionById(result.positionId);
+        const vault = await vaultManager.getVault(telegramId);
+        const pos = await vault.getPositionById(result.positionId);
         if (!pos) return;
-        const wallet = pos.copiedWalletId ? vault.getWatchedWallet(pos.copiedWalletId) : null;
+        const wallet = pos.copiedWalletId ? await vault.getWatchedWallet(pos.copiedWalletId) : null;
+        const settings = await vault.getSettings();
         const investedUsd = pos.initialCostUsd > 0 ? pos.initialCostUsd : pos.costUsd;
         const totalPnlUsd = pos.realizedUsd - investedUsd;
         const roiPct = investedUsd > 0 ? (totalPnlUsd / investedUsd) * 100 : -100;
         const png = await pnlCards.renderPng({
-          theme: vault.getSettings().pnlTheme,
+          theme: settings.pnlTheme,
           chain: pos.chain,
           tokenSymbol: pos.tokenSymbol,
           sourceLabel: wallet ? `Copied: ${wallet.alias}` : "Auto Trade",
@@ -150,8 +173,9 @@ async function main(): Promise<void> {
     weeklyReports.stopScheduler();
     await walletWatcher.stop();
     await botInstance?.stop();
-    vaultManager.closeAll();
-    adminDb.close();
+    await vaultManager.closeAll();
+    await adminDb.close();
+    if (closePgPool) await closePgPool();
     process.exit(0);
   };
 

@@ -3,8 +3,7 @@ import { PublicKey } from "@solana/web3.js";
 import { erc20Abi, parseAbiItem, PublicClient } from "viem";
 import { ChainKey, CHAINS, normalizeAddress } from "../chains/registry.js";
 import { AppConfig } from "../config.js";
-import { AdminDb } from "../db/adminDb.js";
-import { UserVaultManager, WatchedWalletRow } from "../db/userVault.js";
+import { IAdminDb, IVaultManager, WatchedWalletRow } from "../db/types.js";
 import { CopyEngine, DetectedWalletSwap } from "./copyEngine.js";
 import { EvmClientManager } from "./evmClients.js";
 import { SolanaClientManager } from "./solanaClient.js";
@@ -24,8 +23,8 @@ const AERODROME_SWAP_TOPIC = "0xb3e2773606abfd36b5bd91394b3a54d1398336c65005baf7
 
 export class WalletWatcherService {
   private readonly config: AppConfig;
-  private readonly adminDb: AdminDb;
-  private readonly vaultManager: UserVaultManager;
+  private readonly adminDb: IAdminDb;
+  private readonly vaultManager: IVaultManager;
   private readonly evmClients: EvmClientManager;
   private readonly solanaClient: SolanaClientManager;
   private readonly copyEngine: CopyEngine;
@@ -45,8 +44,8 @@ export class WalletWatcherService {
 
   constructor(params: {
     config: AppConfig;
-    adminDb: AdminDb;
-    vaultManager: UserVaultManager;
+    adminDb: IAdminDb;
+    vaultManager: IVaultManager;
     evmClients: EvmClientManager;
     solanaClient: SolanaClientManager;
     copyEngine: CopyEngine;
@@ -104,10 +103,10 @@ export class WalletWatcherService {
     const nextTargets = new Map<string, WatcherTarget[]>();
     const activeSolanaAddrs = new Set<string>();
 
-    for (const userId of this.adminDb.listActiveUserIds()) {
-      if (!this.vaultManager.hasVault(userId)) continue;
-      const vault = this.vaultManager.getVault(userId);
-      for (const w of vault.listWatchedWallets(true)) {
+    for (const userId of await this.adminDb.listActiveUserIds()) {
+      if (!(await this.vaultManager.hasVault(userId))) continue;
+      const vault = await this.vaultManager.getVault(userId);
+      for (const w of await vault.listWatchedWallets(true)) {
         const key = `${w.chain}:${normalizeAddress(w.chain, w.address)}`;
         const arr = nextTargets.get(key) ?? [];
         arr.push({ telegramId: userId, wallet: w });
@@ -630,8 +629,11 @@ export class WalletWatcherService {
     try {
       this.webhookServer = http.createServer((req, res) => {
         if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, service: "codex-degen-box" }));
+          // Light DB heartbeat ensures both Render and Supabase Free stay awake on keep-alive pings
+          void this.adminDb.ping().then((dbOk) => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, db: dbOk, service: "codex-degen-box" }));
+          });
           return;
         }
         if (req.method !== "POST" || req.url !== "/helius-webhook") {

@@ -1,5 +1,5 @@
 import { ChainKey, CHAINS } from "../chains/registry.js";
-import { PositionRow, UserVault } from "../db/userVault.js";
+import { IUserVault, PositionRow } from "../db/types.js";
 import {
   atomicToNumber,
   computeNativeForTokenSell,
@@ -76,8 +76,12 @@ export class TradingEngine {
     return Math.min(4500, Math.max(1, Math.round(ratio * 10_000)));
   }
 
-  getSimulatedNetworkFeeAtomic(chain: ChainKey, vault: UserVault, spendNativeAtomic: bigint): bigint {
-    const settings = vault.getSettings();
+  async getSimulatedNetworkFeeAtomic(
+    chain: ChainKey,
+    vault: IUserVault,
+    spendNativeAtomic: bigint
+  ): Promise<bigint> {
+    const settings = await vault.getSettings();
     const spec = CHAINS[chain];
     const configuredFeeStr = chain === "solana" ? settings.priorityFeeSol : settings.evmGasEth;
     let configuredFee = 0n;
@@ -93,7 +97,7 @@ export class TradingEngine {
     return configuredFee;
   }
 
-  async executeBuy(vault: UserVault, req: BuyRequest): Promise<ExecutionResult> {
+  async executeBuy(vault: IUserVault, req: BuyRequest): Promise<ExecutionResult> {
     const spec = CHAINS[req.chain];
     if (req.spendNativeAtomic <= 0n) {
       throw new Error("Buy amount must be greater than 0.");
@@ -110,7 +114,7 @@ export class TradingEngine {
       throw new Error("Trade blocked: Token contract currently prevents buying.");
     }
 
-    const settings = vault.getSettings();
+    const settings = await vault.getSettings();
     const maxSlippageBps = req.slippageBpsOverride ?? settings.slippageBps;
     const spendUsd = nativeAtomicToUsd(req.spendNativeAtomic, spec.nativeDecimals, snap.nativePriceUsd);
     const impactBps = this.computeLiquidityImpactBps(spendUsd, snap.liquidityUsd);
@@ -125,8 +129,8 @@ export class TradingEngine {
     }
 
     const effectiveBuyPriceUsd = snap.priceUsd * (1 + impactBps / 10_000);
-    const feeAtomic = this.getSimulatedNetworkFeeAtomic(req.chain, vault, req.spendNativeAtomic);
-    const balance = vault.getBalance(req.chain).balanceAtomic;
+    const feeAtomic = await this.getSimulatedNetworkFeeAtomic(req.chain, vault, req.spendNativeAtomic);
+    const balance = (await vault.getBalance(req.chain)).balanceAtomic;
 
     // Deduct fee cleanly; if user wants to spend 100% of exact balance, deduct fee out of spend if needed
     let netSpendNativeAtomic = req.spendNativeAtomic;
@@ -160,19 +164,19 @@ export class TradingEngine {
     const netSpendUsd = nativeAtomicToUsd(netSpendNativeAtomic, spec.nativeDecimals, snap.nativePriceUsd);
     const now = Date.now();
 
-    const out = vault.runInTransaction(() => {
-      const remainingBalanceAtomic = vault.adjustBalance(req.chain, -totalWalletDebit);
+    const out = await vault.runInTransaction(async () => {
+      const remainingBalanceAtomic = await vault.adjustBalance(req.chain, -totalWalletDebit);
 
       // Keep copied positions isolated per watched wallet for clean weekly attribution
       const existingPos =
         req.sourceType === "copy" && req.copiedWalletId
-          ? vault.getOpenPosition(req.chain, req.tokenAddress, req.copiedWalletId)
-          : vault.getOpenPosition(req.chain, req.tokenAddress);
+          ? await vault.getOpenPosition(req.chain, req.tokenAddress, req.copiedWalletId)
+          : await vault.getOpenPosition(req.chain, req.tokenAddress);
 
       let positionId: number;
       if (existingPos && (req.sourceType !== "copy" || existingPos.copiedWalletId === req.copiedWalletId)) {
         positionId = existingPos.id;
-        vault.addToPosition({
+        await vault.addToPosition({
           id: positionId,
           addedTokensAtomic: receivedTokensAtomic,
           addedNativeAtomic: totalWalletDebit,
@@ -181,7 +185,7 @@ export class TradingEngine {
           newMcUsd: snap.mcUsd
         });
       } else {
-        positionId = vault.createPosition({
+        positionId = await vault.createPosition({
           chain: req.chain,
           tokenAddress: req.tokenAddress,
           tokenSymbol: snap.symbol,
@@ -203,7 +207,7 @@ export class TradingEngine {
         });
       }
 
-      const tradeId = vault.recordTrade({
+      const tradeId = await vault.recordTrade({
         positionId,
         chain: req.chain,
         side: "buy",
@@ -257,8 +261,8 @@ export class TradingEngine {
     };
   }
 
-  async executeSell(vault: UserVault, req: SellRequest): Promise<ExecutionResult> {
-    const pos = vault.getPositionById(req.positionId);
+  async executeSell(vault: IUserVault, req: SellRequest): Promise<ExecutionResult> {
+    const pos = await vault.getPositionById(req.positionId);
     if (!pos || pos.status !== "open") {
       throw new Error("Open position not found.");
     }
@@ -295,8 +299,8 @@ export class TradingEngine {
       snap.liquidityUsd < 50;
 
     if (isRugged) {
-      const out = vault.runInTransaction(() => {
-        const reduced = vault.reduceOrClosePosition({
+      const out = await vault.runInTransaction(async () => {
+        const reduced = await vault.reduceOrClosePosition({
           id: pos.id,
           soldTokensAtomic: pos.qtyTokenAtomic,
           receivedNativeAtomic: 0n,
@@ -310,7 +314,7 @@ export class TradingEngine {
         const pnlNative = -reduced.costBasisSoldNative;
         const pnlUsd = -reduced.costBasisSoldUsd;
 
-        const tradeId = vault.recordTrade({
+        const tradeId = await vault.recordTrade({
           positionId: pos.id,
           chain: pos.chain,
           side: "rug_writeoff",
@@ -337,12 +341,12 @@ export class TradingEngine {
           executedAt: now
         });
 
-        this.cancelPositionOrders(vault, pos.id);
+        await this.cancelPositionOrders(vault, pos.id);
         return {
           tradeId,
           pnlNative,
           pnlUsd,
-          remainingBalanceAtomic: vault.getBalance(pos.chain).balanceAtomic
+          remainingBalanceAtomic: (await vault.getBalance(pos.chain)).balanceAtomic
         };
       });
 
@@ -409,12 +413,12 @@ export class TradingEngine {
       effectiveSellPriceUsd
     );
     const afterTaxNative = (grossNative * BigInt(Math.max(0, 10_000 - sec.sellTaxBps))) / 10_000n;
-    const feeAtomic = this.getSimulatedNetworkFeeAtomic(pos.chain, vault, afterTaxNative);
+    const feeAtomic = await this.getSimulatedNetworkFeeAtomic(pos.chain, vault, afterTaxNative);
     const netReceivedNative = afterTaxNative > feeAtomic ? afterTaxNative - feeAtomic : afterTaxNative;
     const netReceivedUsd = nativeAtomicToUsd(netReceivedNative, spec.nativeDecimals, snap.nativePriceUsd);
 
-    const out = vault.runInTransaction(() => {
-      const reduced = vault.reduceOrClosePosition({
+    const out = await vault.runInTransaction(async () => {
+      const reduced = await vault.reduceOrClosePosition({
         id: pos.id,
         soldTokensAtomic: tokensToSell,
         receivedNativeAtomic: netReceivedNative,
@@ -427,9 +431,9 @@ export class TradingEngine {
 
       const pnlNative = netReceivedNative - reduced.costBasisSoldNative;
       const pnlUsd = netReceivedUsd - reduced.costBasisSoldUsd;
-      const remainingBalanceAtomic = vault.adjustBalance(pos.chain, netReceivedNative);
+      const remainingBalanceAtomic = await vault.adjustBalance(pos.chain, netReceivedNative);
 
-      const tradeId = vault.recordTrade({
+      const tradeId = await vault.recordTrade({
         positionId: pos.id,
         chain: pos.chain,
         side: "sell",
@@ -457,7 +461,7 @@ export class TradingEngine {
       });
 
       if (reduced.closed) {
-        this.cancelPositionOrders(vault, pos.id);
+        await this.cancelPositionOrders(vault, pos.id);
       }
       return {
         tradeId,
@@ -516,11 +520,11 @@ export class TradingEngine {
     return { currentValueUsd, currentValueNativeAtomic, pnlUsd, pnlPct };
   }
 
-  private cancelPositionOrders(vault: UserVault, positionId: number): void {
-    const active = vault.listActiveOrders();
+  private async cancelPositionOrders(vault: IUserVault, positionId: number): Promise<void> {
+    const active = await vault.listActiveOrders();
     for (const o of active) {
       if (o.positionId === positionId && o.orderType !== "limit_buy" && o.orderType !== "dca") {
-        vault.setOrderStatus(o.id, "cancelled");
+        await vault.setOrderStatus(o.id, "cancelled");
       }
     }
   }

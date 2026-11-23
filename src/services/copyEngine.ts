@@ -1,5 +1,5 @@
 import { ChainKey, CHAINS, shortAddress } from "../chains/registry.js";
-import { UserVault, UserVaultManager, WatchedWalletRow } from "../db/userVault.js";
+import { IUserVault, IVaultManager, WatchedWalletRow } from "../db/types.js";
 import { formatExactUnits, formatUsd } from "../utils/amounts.js";
 import { MarketDataService } from "./marketData.js";
 import { SecurityService } from "./security.js";
@@ -24,14 +24,14 @@ export type CopyNotifyCallback = (
 ) => Promise<void>;
 
 export class CopyEngine {
-  private readonly vaultManager: UserVaultManager;
+  private readonly vaultManager: IVaultManager;
   private readonly market: MarketDataService;
   private readonly security: SecurityService;
   private readonly trading: TradingEngine;
   private readonly onNotify: CopyNotifyCallback;
 
   constructor(params: {
-    vaultManager: UserVaultManager;
+    vaultManager: IVaultManager;
     market: MarketDataService;
     security: SecurityService;
     trading: TradingEngine;
@@ -49,12 +49,12 @@ export class CopyEngine {
     wallet: WatchedWalletRow,
     swap: DetectedWalletSwap
   ): Promise<void> {
-    const vault = this.vaultManager.getVault(telegramId);
-    const settings = vault.getSettings();
+    const vault = await this.vaultManager.getVault(telegramId);
+    const settings = await vault.getSettings();
     const spec = CHAINS[swap.chain];
 
     if (!wallet.enabled) {
-      vault.recordObservedSwap({
+      await vault.recordObservedSwap({
         watchedWalletId: wallet.id,
         chain: swap.chain,
         txHash: swap.txHash,
@@ -123,7 +123,7 @@ export class CopyEngine {
 
   private async handleWatchedBuy(ctx: {
     telegramId: string;
-    vault: UserVault;
+    vault: IUserVault;
     wallet: WatchedWalletRow;
     swap: DetectedWalletSwap;
     snap: Awaited<ReturnType<MarketDataService["getTokenSnapshot"]>>;
@@ -158,12 +158,12 @@ export class CopyEngine {
       });
 
     if (!ctx.snap) {
-      recordSwap("skipped_filter", "No live liquidity pool found");
+      await recordSwap("skipped_filter", "No live liquidity pool found");
       return;
     }
 
     if (ctx.wallet.blockRisky && ctx.isRug) {
-      if (recordSwap("skipped_risk", "Blocked by safety filter") && ctx.notifyEnabled) {
+      if ((await recordSwap("skipped_risk", "Blocked by safety filter")) && ctx.notifyEnabled) {
         await this.onNotify(
           ctx.telegramId,
           `🛡️ *Copy Skipped (Risk)*: *${ctx.wallet.alias}* bought *${ctx.symbol}* (${ctx.specBadge}), blocked due to safety warnings.`
@@ -173,24 +173,24 @@ export class CopyEngine {
     }
 
     if (ctx.wallet.minMcUsd !== null && ctx.snap.mcUsd < ctx.wallet.minMcUsd) {
-      recordSwap("skipped_filter", `MC ${formatUsd(ctx.snap.mcUsd)} < min ${formatUsd(ctx.wallet.minMcUsd)}`);
+      await recordSwap("skipped_filter", `MC ${formatUsd(ctx.snap.mcUsd)} < min ${formatUsd(ctx.wallet.minMcUsd)}`);
       return;
     }
     if (ctx.wallet.maxMcUsd !== null && ctx.snap.mcUsd > ctx.wallet.maxMcUsd) {
-      recordSwap("skipped_filter", `MC ${formatUsd(ctx.snap.mcUsd)} > max ${formatUsd(ctx.wallet.maxMcUsd)}`);
+      await recordSwap("skipped_filter", `MC ${formatUsd(ctx.snap.mcUsd)} > max ${formatUsd(ctx.wallet.maxMcUsd)}`);
       return;
     }
     if (ctx.wallet.minLiqUsd !== null && ctx.snap.liquidityUsd < ctx.wallet.minLiqUsd) {
-      recordSwap("skipped_filter", `Liq ${formatUsd(ctx.snap.liquidityUsd)} < min ${formatUsd(ctx.wallet.minLiqUsd)}`);
+      await recordSwap("skipped_filter", `Liq ${formatUsd(ctx.snap.liquidityUsd)} < min ${formatUsd(ctx.wallet.minLiqUsd)}`);
       return;
     }
 
-    if (ctx.wallet.skipIfHeld && ctx.vault.getOpenPosition(ctx.swap.chain, ctx.swap.tokenAddress)) {
-      recordSwap("skipped_duplicate", "Already holding token");
+    if (ctx.wallet.skipIfHeld && (await ctx.vault.getOpenPosition(ctx.swap.chain, ctx.swap.tokenAddress))) {
+      await recordSwap("skipped_duplicate", "Already holding token");
       return;
     }
 
-    const available = ctx.vault.getBalance(ctx.swap.chain).balanceAtomic;
+    const available = (await ctx.vault.getBalance(ctx.swap.chain)).balanceAtomic;
     let spendAtomic = 0n;
     if (ctx.wallet.copyMode === "fixed") {
       spendAtomic = ctx.wallet.copyAmountAtomic;
@@ -203,7 +203,7 @@ export class CopyEngine {
     }
 
     if (spendAtomic <= 0n || available < spendAtomic) {
-      if (recordSwap("skipped_balance", "Insufficient virtual balance") && ctx.notifyEnabled) {
+      if ((await recordSwap("skipped_balance", "Insufficient virtual balance")) && ctx.notifyEnabled) {
         await this.onNotify(
           ctx.telegramId,
           `⚠️ *Copy Skipped (Low Balance)*: *${ctx.wallet.alias}* bought *${ctx.symbol}* (${ctx.specBadge}), but you only have ${formatExactUnits(available, ctx.specNativeDecimals)} ${ctx.specNativeSymbol}.`
@@ -212,7 +212,7 @@ export class CopyEngine {
       return;
     }
 
-    const inserted = recordSwap("copied", null);
+    const inserted = await recordSwap("copied", null);
     if (!inserted) return;
 
     try {
@@ -231,7 +231,7 @@ export class CopyEngine {
 
       // Attach automatic TP/SL orders if configured on this watcher
       if (ctx.wallet.autoTpPct !== null && ctx.wallet.autoTpPct > 0) {
-        ctx.vault.createOrder({
+        await ctx.vault.createOrder({
           chain: ctx.swap.chain,
           tokenAddress: ctx.swap.tokenAddress,
           tokenSymbol: res.tokenSymbol,
@@ -250,7 +250,7 @@ export class CopyEngine {
         });
       }
       if (ctx.wallet.autoSlPct !== null && ctx.wallet.autoSlPct < 0) {
-        ctx.vault.createOrder({
+        await ctx.vault.createOrder({
           chain: ctx.swap.chain,
           tokenAddress: ctx.swap.tokenAddress,
           tokenSymbol: res.tokenSymbol,
@@ -292,7 +292,7 @@ export class CopyEngine {
 
   private async handleWatchedSell(ctx: {
     telegramId: string;
-    vault: UserVault;
+    vault: IUserVault;
     wallet: WatchedWalletRow;
     swap: DetectedWalletSwap;
     snap: Awaited<ReturnType<MarketDataService["getTokenSnapshot"]>>;
@@ -304,10 +304,10 @@ export class CopyEngine {
     specNativeSymbol: string;
     specBadge: string;
   }): Promise<void> {
-    const openPos = ctx.vault.getOpenPosition(ctx.swap.chain, ctx.swap.tokenAddress, ctx.wallet.id);
+    const openPos = await ctx.vault.getOpenPosition(ctx.swap.chain, ctx.swap.tokenAddress, ctx.wallet.id);
 
     if (!ctx.wallet.mirrorSells || !openPos) {
-      ctx.vault.recordObservedSwap({
+      await ctx.vault.recordObservedSwap({
         watchedWalletId: ctx.wallet.id,
         chain: ctx.swap.chain,
         txHash: ctx.swap.txHash,
@@ -328,7 +328,7 @@ export class CopyEngine {
       return;
     }
 
-    const inserted = ctx.vault.recordObservedSwap({
+    const inserted = await ctx.vault.recordObservedSwap({
       watchedWalletId: ctx.wallet.id,
       chain: ctx.swap.chain,
       txHash: ctx.swap.txHash,

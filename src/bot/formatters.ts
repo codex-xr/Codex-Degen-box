@@ -5,7 +5,7 @@ import {
   explorerTokenUrl,
   shortAddress
 } from "../chains/registry.js";
-import { OrderRow, PositionRow, UserVault, WatchedWalletRow } from "../db/userVault.js";
+import { IUserVault, OrderRow, PositionRow, WatchedWalletRow } from "../db/types.js";
 import { TokenSnapshot } from "../services/marketData.js";
 import { TokenSecurityReport } from "../services/security.js";
 import { TradingEngine } from "../services/tradingEngine.js";
@@ -20,12 +20,14 @@ export function escapeMd(text: string): string {
   return text.replace(/([_*`\[])/g, "\\$1");
 }
 
-export function formatHomeMessage(vault: UserVault, isAdmin: boolean): string {
-  const balances = vault.getBalances();
-  const settings = vault.getSettings();
-  const openPositions = vault.listOpenPositions();
-  const activeOrders = vault.listActiveOrders();
-  const watchers = vault.listWatchedWallets(false);
+export async function formatHomeMessage(vault: IUserVault, isAdmin: boolean): Promise<string> {
+  const [balances, settings, openPositions, activeOrders, watchers] = await Promise.all([
+    vault.getBalances(),
+    vault.getSettings(),
+    vault.listOpenPositions(),
+    vault.listActiveOrders(),
+    vault.listWatchedWallets(false)
+  ]);
   const enabledWatchers = watchers.filter((w) => w.enabled).length;
 
   const lines: string[] = [

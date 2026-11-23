@@ -1,7 +1,13 @@
 import { ChainKey, CHAINS } from "../chains/registry.js";
 import { AppConfig } from "../config.js";
-import { AdminDb } from "../db/adminDb.js";
-import { PositionRow, UserVault, UserVaultManager, WatchedWalletRow } from "../db/userVault.js";
+import {
+  IAdminDb,
+  IUserVault,
+  IVaultManager,
+  ObservedSwapRow,
+  PositionRow,
+  WatchedWalletRow
+} from "../db/types.js";
 import { formatDuration, formatUsd } from "../utils/amounts.js";
 import { MarketDataService } from "./marketData.js";
 
@@ -72,16 +78,16 @@ export interface WeeklySummaryData {
 
 export class WeeklyReportService {
   private readonly config: AppConfig;
-  private readonly adminDb: AdminDb;
-  private readonly vaultManager: UserVaultManager;
+  private readonly adminDb: IAdminDb;
+  private readonly vaultManager: IVaultManager;
   private readonly market: MarketDataService;
   private timer: NodeJS.Timeout | null = null;
   private onAutoReport?: (telegramId: string, reportText: string) => Promise<void>;
 
   constructor(params: {
     config: AppConfig;
-    adminDb: AdminDb;
-    vaultManager: UserVaultManager;
+    adminDb: IAdminDb;
+    vaultManager: IVaultManager;
     market: MarketDataService;
   }) {
     this.config = params.config;
@@ -116,12 +122,12 @@ export class WeeklyReportService {
     }
 
     const weekAgo = Date.now() - 6 * 24 * 3600_000;
-    for (const userId of this.adminDb.listActiveUserIds()) {
-      if (!this.vaultManager.hasVault(userId)) continue;
-      const vault = this.vaultManager.getVault(userId);
-      if (!vault.getSettings().weeklyReportEnabled) continue;
+    for (const userId of await this.adminDb.listActiveUserIds()) {
+      if (!(await this.vaultManager.hasVault(userId))) continue;
+      const vault = await this.vaultManager.getVault(userId);
+      if (!(await vault.getSettings()).weeklyReportEnabled) continue;
 
-      const latest = vault.getLatestWeeklyReport();
+      const latest = await vault.getLatestWeeklyReport();
       if (latest && latest.createdAt >= weekAgo) continue;
 
       try {
@@ -134,14 +140,14 @@ export class WeeklyReportService {
   }
 
   async generateForUser(
-    vault: UserVault,
+    vault: IUserVault,
     days = 7
   ): Promise<{ summary: WeeklySummaryData; formattedText: string }> {
     const periodEnd = Date.now();
     const periodStart = periodEnd - days * 24 * 3600_000;
 
     // Refresh live marks for open positions so unrealized numbers are up to date
-    const openPositions = vault.listOpenPositions();
+    const openPositions = await vault.listOpenPositions();
     const byChain = new Map<ChainKey, string[]>();
     for (const p of openPositions) {
       const list = byChain.get(p.chain) ?? [];
@@ -153,14 +159,14 @@ export class WeeklyReportService {
       for (const p of openPositions) {
         if (p.chain !== chain) continue;
         const s = snaps.get(p.tokenAddress);
-        if (s) vault.updatePositionMark(p.id, s.priceUsd, s.mcUsd);
+        if (s) await vault.updatePositionMark(p.id, s.priceUsd, s.mcUsd);
       }
     }
 
-    const trades = vault.listTradesBetween(periodStart, periodEnd);
-    const positions = vault.listPositionsInPeriod(periodStart, periodEnd);
-    const wallets = vault.listWatchedWallets(false);
-    const observedSwaps = vault.listObservedSwapsBetween(periodStart, periodEnd);
+    const trades = await vault.listTradesBetween(periodStart, periodEnd);
+    const positions = await vault.listPositionsInPeriod(periodStart, periodEnd);
+    const wallets = await vault.listWatchedWallets(false);
+    const observedSwaps = await vault.listObservedSwapsBetween(periodStart, periodEnd);
 
     const summary = this.computeSummary({
       periodStart,
@@ -174,7 +180,7 @@ export class WeeklyReportService {
     const aiInsight = await this.tryGenerateAiCommentary(summary);
     const formattedText = this.formatReportMessage(summary, days, aiInsight);
 
-    vault.saveWeeklyReport({
+    await vault.saveWeeklyReport({
       periodStart,
       periodEnd,
       summaryJson: JSON.stringify(summary),
@@ -190,7 +196,7 @@ export class WeeklyReportService {
     tradesCount: number;
     positions: PositionRow[];
     wallets: WatchedWalletRow[];
-    observedSwaps: ReturnType<UserVault["listObservedSwapsBetween"]>;
+    observedSwaps: ObservedSwapRow[];
   }): WeeklySummaryData {
     const walletMap = new Map(input.wallets.map((w) => [w.id, w]));
 

@@ -26,6 +26,7 @@ export interface AppConfig {
   dataDir: string;
   adminDbPath: string;
   userVaultDir: string;
+  databaseUrl: string;
   heliusApiKey: string;
   solanaRpcUrl: string;
   solanaWsUrl: string;
@@ -65,6 +66,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     dataDir,
     adminDbPath: overrides.adminDbPath ?? path.join(dataDir, "admin.db"),
     userVaultDir: overrides.userVaultDir ?? path.join(dataDir, "users"),
+    databaseUrl: (overrides.databaseUrl ?? process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim(),
     heliusApiKey,
     solanaRpcUrl: (overrides.solanaRpcUrl ?? process.env.SOLANA_RPC_URL ?? defaultSolRpc).trim(),
     solanaWsUrl: (overrides.solanaWsUrl ?? process.env.SOLANA_WS_URL ?? defaultSolWs).trim(),

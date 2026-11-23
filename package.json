@@ -21,11 +21,13 @@
     "@solana/web3.js": "^3.2.1",
     "dotenv": "^18.0.10",
     "grammy": "^1.48.0",
+    "pg": "^8.23.1",
     "satori": "^0.63.2",
     "viem": "^2.58.4"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }

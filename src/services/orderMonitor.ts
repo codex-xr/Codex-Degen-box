@@ -1,6 +1,5 @@
 import { ChainKey, CHAINS } from "../chains/registry.js";
-import { AdminDb } from "../db/adminDb.js";
-import { OrderRow, PositionRow, UserVault, UserVaultManager } from "../db/userVault.js";
+import { IAdminDb, IUserVault, IVaultManager, OrderRow, PositionRow } from "../db/types.js";
 import { formatExactUnits, formatUsd } from "../utils/amounts.js";
 import { MarketDataService, TokenSnapshot } from "./marketData.js";
 import { SecurityService } from "./security.js";
@@ -9,8 +8,8 @@ import { ExecutionResult, TradingEngine } from "./tradingEngine.js";
 export type OrderNotifyHandler = (telegramId: string, text: string, result?: ExecutionResult) => Promise<void>;
 
 export class OrderMonitorService {
-  private readonly adminDb: AdminDb;
-  private readonly vaultManager: UserVaultManager;
+  private readonly adminDb: IAdminDb;
+  private readonly vaultManager: IVaultManager;
   private readonly market: MarketDataService;
   private readonly security: SecurityService;
   private readonly trading: TradingEngine;
@@ -19,8 +18,8 @@ export class OrderMonitorService {
   private running = false;
 
   constructor(params: {
-    adminDb: AdminDb;
-    vaultManager: UserVaultManager;
+    adminDb: IAdminDb;
+    vaultManager: IVaultManager;
     market: MarketDataService;
     security: SecurityService;
     trading: TradingEngine;
@@ -52,10 +51,10 @@ export class OrderMonitorService {
     if (this.running) return;
     this.running = true;
     try {
-      const userIds = this.adminDb.listActiveUserIds();
+      const userIds = await this.adminDb.listActiveUserIds();
       for (const userId of userIds) {
-        if (!this.vaultManager.hasVault(userId)) continue;
-        const vault = this.vaultManager.getVault(userId);
+        if (!(await this.vaultManager.hasVault(userId))) continue;
+        const vault = await this.vaultManager.getVault(userId);
         await this.processUserVault(userId, vault);
       }
     } catch {
@@ -65,9 +64,9 @@ export class OrderMonitorService {
     }
   }
 
-  async processUserVault(userId: string, vault: UserVault): Promise<void> {
-    const positions = vault.listOpenPositions();
-    const orders = vault.listActiveOrders();
+  async processUserVault(userId: string, vault: IUserVault): Promise<void> {
+    const positions = await vault.listOpenPositions();
+    const orders = await vault.listActiveOrders();
     if (positions.length === 0 && orders.length === 0) return;
 
     // Group tokens by chain for fast batched market fetches
@@ -99,7 +98,7 @@ export class OrderMonitorService {
       const snap = snapshots.get(`${pos.chain}:${pos.tokenAddress}`);
       if (!snap) continue;
 
-      vault.updatePositionMark(pos.id, snap.priceUsd, snap.mcUsd);
+      await vault.updatePositionMark(pos.id, snap.priceUsd, snap.mcUsd);
 
       if (snap.liquidityUsd < 50 && pos.entryLiqUsd >= 500) {
         try {
@@ -132,7 +131,7 @@ export class OrderMonitorService {
 
   private async evaluateOrder(
     userId: string,
-    vault: UserVault,
+    vault: IUserVault,
     order: OrderRow,
     snap: TokenSnapshot | null,
     posMap: Map<number, PositionRow>,
@@ -152,7 +151,7 @@ export class OrderMonitorService {
           sourceType: "limit",
           snapshotOverride: snap
         });
-        vault.setOrderStatus(order.id, "filled");
+        await vault.setOrderStatus(order.id, "filled");
         const spec = CHAINS[order.chain];
         await this.onNotify(
           userId,
@@ -161,7 +160,7 @@ export class OrderMonitorService {
           res
         );
       } catch (err) {
-        vault.setOrderStatus(order.id, "cancelled");
+        await vault.setOrderStatus(order.id, "cancelled");
         await this.onNotify(
           userId,
           `⚠️ *Limit Buy Cancelled* for *${order.tokenSymbol}*: ${(err as Error).message}`
@@ -183,7 +182,7 @@ export class OrderMonitorService {
         const remaining = Math.max(0, (order.dcaRemaining ?? 1) - 1);
         const nextRunAt =
           remaining > 0 && order.dcaIntervalSec ? now + order.dcaIntervalSec * 1000 : null;
-        vault.advanceDcaOrder(order.id, remaining, nextRunAt);
+        await vault.advanceDcaOrder(order.id, remaining, nextRunAt);
         const spec = CHAINS[order.chain];
         await this.onNotify(
           userId,
@@ -192,7 +191,7 @@ export class OrderMonitorService {
           res
         );
       } catch (err) {
-        vault.setOrderStatus(order.id, "cancelled");
+        await vault.setOrderStatus(order.id, "cancelled");
         await this.onNotify(
           userId,
           `⚠️ *DCA Order Stopped* for *${order.tokenSymbol}*: ${(err as Error).message}`
@@ -205,7 +204,7 @@ export class OrderMonitorService {
     if (!order.positionId || !snap) return;
     const pos = posMap.get(order.positionId);
     if (!pos || pos.status !== "open" || pos.entryPriceUsd <= 0) {
-      vault.setOrderStatus(order.id, "cancelled");
+      await vault.setOrderStatus(order.id, "cancelled");
       return;
     }
 
@@ -225,7 +224,7 @@ export class OrderMonitorService {
       const prevHigh = order.highestPriceUsd ?? pos.entryPriceUsd;
       const newHigh = Math.max(prevHigh, snap.priceUsd);
       if (newHigh > prevHigh) {
-        vault.updateOrderHighestPrice(order.id, newHigh);
+        await vault.updateOrderHighestPrice(order.id, newHigh);
       }
       const dropFromHighPct = ((newHigh - snap.priceUsd) / newHigh) * 100;
       if (dropFromHighPct >= order.trailingDropPct) {
@@ -244,7 +243,7 @@ export class OrderMonitorService {
 
   private async triggerPositionSell(
     userId: string,
-    vault: UserVault,
+    vault: IUserVault,
     order: OrderRow,
     pos: PositionRow,
     snap: TokenSnapshot,
@@ -258,7 +257,7 @@ export class OrderMonitorService {
         sourceType,
         snapshotOverride: snap
       });
-      vault.setOrderStatus(order.id, "filled");
+      await vault.setOrderStatus(order.id, "filled");
       const spec = CHAINS[pos.chain];
       await this.onNotify(
         userId,

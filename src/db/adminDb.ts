@@ -2,40 +2,13 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-
-export type UserRole = "admin" | "member";
-
-export interface AuthorizedUser {
-  telegramId: string;
-  username: string | null;
-  firstName: string | null;
-  role: UserRole;
-  codeUsed: string | null;
-  joinedAt: number;
-  isBanned: boolean;
-}
-
-export interface AccessCode {
-  code: string;
-  label: string | null;
-  role: UserRole;
-  createdBy: string;
-  createdAt: number;
-  expiresAt: number | null;
-  maxUses: number;
-  usesCount: number;
-  revoked: boolean;
-}
-
-export type RedeemResult =
-  | { ok: true; user: AuthorizedUser; alreadyAuthorized: boolean }
-  | { ok: false; reason: string };
+import { AccessCode, AuthorizedUser, IAdminDb, RedeemResult, UserRole } from "./types.js";
+export * from "./types.js";
 
 /**
- * Central gatekeeper DB: ONLY holds invite codes and Telegram user authorization.
- * Zero balances, trades, watched wallets, or reports ever live here.
+ * Local SQLite fallback gatekeeper DB: ONLY holds invite codes and Telegram user authorization.
  */
-export class AdminDb {
+export class AdminDb implements IAdminDb {
   private readonly db: DatabaseSync;
   private readonly maxCabalUsers: number;
   private readonly adminBootstrapCode: string;
@@ -76,11 +49,22 @@ export class AdminDb {
     `);
   }
 
-  close(): void {
+  async init(): Promise<void> {}
+
+  async ping(): Promise<boolean> {
+    try {
+      this.db.prepare("SELECT 1").get();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async close(): Promise<void> {
     this.db.close();
   }
 
-  ensureAdminsFromConfig(adminIds: Set<string>): void {
+  async ensureAdminsFromConfig(adminIds: Set<string>): Promise<void> {
     const now = Date.now();
     const upsert = this.db.prepare(`
       INSERT INTO authorized_users (telegram_id, role, code_used, joined_at, is_banned)
@@ -92,7 +76,7 @@ export class AdminDb {
     }
   }
 
-  getUser(telegramId: string): AuthorizedUser | null {
+  async getUser(telegramId: string): Promise<AuthorizedUser | null> {
     const row = this.db
       .prepare(`SELECT * FROM authorized_users WHERE telegram_id = ?`)
       .get(telegramId) as Record<string, unknown> | undefined;
@@ -100,52 +84,52 @@ export class AdminDb {
     return this.mapUser(row);
   }
 
-  isAuthorized(telegramId: string): { authorized: boolean; user: AuthorizedUser | null } {
-    const user = this.getUser(telegramId);
+  async isAuthorized(telegramId: string): Promise<{ authorized: boolean; user: AuthorizedUser | null }> {
+    const user = await this.getUser(telegramId);
     if (!user || user.isBanned) return { authorized: false, user };
     return { authorized: true, user };
   }
 
-  isAdmin(telegramId: string): boolean {
-    const user = this.getUser(telegramId);
+  async isAdmin(telegramId: string): Promise<boolean> {
+    const user = await this.getUser(telegramId);
     return Boolean(user && !user.isBanned && user.role === "admin");
   }
 
-  countActiveUsers(): number {
+  async countActiveUsers(): Promise<number> {
     const row = this.db
       .prepare(`SELECT COUNT(*) as cnt FROM authorized_users WHERE is_banned = 0`)
       .get() as { cnt: number };
     return Number(row.cnt);
   }
 
-  countActiveAdmins(): number {
+  async countActiveAdmins(): Promise<number> {
     const row = this.db
       .prepare(`SELECT COUNT(*) as cnt FROM authorized_users WHERE is_banned = 0 AND role = 'admin'`)
       .get() as { cnt: number };
     return Number(row.cnt);
   }
 
-  listActiveUserIds(): string[] {
+  async listActiveUserIds(): Promise<string[]> {
     const rows = this.db
       .prepare(`SELECT telegram_id FROM authorized_users WHERE is_banned = 0 ORDER BY joined_at ASC`)
       .all() as Array<{ telegram_id: string }>;
     return rows.map((r) => r.telegram_id);
   }
 
-  listUsers(): AuthorizedUser[] {
+  async listUsers(): Promise<AuthorizedUser[]> {
     const rows = this.db
       .prepare(`SELECT * FROM authorized_users ORDER BY joined_at ASC`)
       .all() as Array<Record<string, unknown>>;
     return rows.map((r) => this.mapUser(r));
   }
 
-  generateAccessCode(params: {
+  async generateAccessCode(params: {
     createdBy: string;
     label?: string;
     maxUses?: number;
     expiresInHours?: number | null;
     role?: UserRole;
-  }): AccessCode {
+  }): Promise<AccessCode> {
     const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     const randomChunk = (len: number) => {
       const bytes = crypto.randomBytes(len);
@@ -184,7 +168,7 @@ export class AdminDb {
     };
   }
 
-  listAccessCodes(includeExhausted = false): AccessCode[] {
+  async listAccessCodes(includeExhausted = false): Promise<AccessCode[]> {
     const query = includeExhausted
       ? `SELECT * FROM access_codes ORDER BY created_at DESC LIMIT 50`
       : `SELECT * FROM access_codes WHERE revoked = 0 AND uses_count < max_uses ORDER BY created_at DESC LIMIT 50`;
@@ -192,7 +176,7 @@ export class AdminDb {
     return rows.map((r) => this.mapCode(r));
   }
 
-  revokeAccessCode(codeInput: string): boolean {
+  async revokeAccessCode(codeInput: string): Promise<boolean> {
     const code = codeInput.trim().toUpperCase();
     const res = this.db
       .prepare(`UPDATE access_codes SET revoked = 1 WHERE code = ? AND revoked = 0`)
@@ -200,31 +184,31 @@ export class AdminDb {
     return Number(res.changes) > 0;
   }
 
-  banUser(telegramId: string): boolean {
+  async banUser(telegramId: string): Promise<boolean> {
     const res = this.db
       .prepare(`UPDATE authorized_users SET is_banned = 1 WHERE telegram_id = ?`)
       .run(telegramId);
     return Number(res.changes) > 0;
   }
 
-  unbanUser(telegramId: string): boolean {
+  async unbanUser(telegramId: string): Promise<boolean> {
     const res = this.db
       .prepare(`UPDATE authorized_users SET is_banned = 0 WHERE telegram_id = ?`)
       .run(telegramId);
     return Number(res.changes) > 0;
   }
 
-  redeemCode(params: {
+  async redeemCode(params: {
     code: string;
     telegramId: string;
     username?: string | null;
     firstName?: string | null;
-  }): RedeemResult {
+  }): Promise<RedeemResult> {
     const rawCode = params.code.trim();
     const upperCode = rawCode.toUpperCase();
     const now = Date.now();
 
-    const existing = this.getUser(params.telegramId);
+    const existing = await this.getUser(params.telegramId);
     if (existing) {
       if (existing.isBanned) {
         return { ok: false, reason: "Your access has been disabled by the admin." };
@@ -232,11 +216,10 @@ export class AdminDb {
       return { ok: true, user: existing, alreadyAuthorized: true };
     }
 
-    // Optional first-admin bootstrap secret from .env
     if (
       this.adminBootstrapCode.length > 0 &&
       rawCode === this.adminBootstrapCode &&
-      this.countActiveAdmins() === 0
+      (await this.countActiveAdmins()) === 0
     ) {
       this.db
         .prepare(
@@ -246,7 +229,7 @@ export class AdminDb {
         .run(params.telegramId, params.username ?? null, params.firstName ?? null, now);
       return {
         ok: true,
-        user: this.getUser(params.telegramId)!,
+        user: (await this.getUser(params.telegramId))!,
         alreadyAuthorized: false
       };
     }
@@ -276,7 +259,7 @@ export class AdminDb {
         return { ok: false, reason: "That invite code has already been used." };
       }
 
-      if (codeObj.role !== "admin" && this.countActiveUsers() >= this.maxCabalUsers) {
+      if (codeObj.role !== "admin" && (await this.countActiveUsers()) >= this.maxCabalUsers) {
         this.db.exec("ROLLBACK;");
         return {
           ok: false,
@@ -305,7 +288,7 @@ export class AdminDb {
       this.db.exec("COMMIT;");
       return {
         ok: true,
-        user: this.getUser(params.telegramId)!,
+        user: (await this.getUser(params.telegramId))!,
         alreadyAuthorized: false
       };
     } catch (err) {
