@@ -205,12 +205,10 @@ export class WalletWatcherService {
 
       for (const addr of solAddresses) {
         try {
-          const sigs = await this.solanaClient.connection.getSignaturesForAddress(
-            new PublicKey(addr),
-            { limit: 4 },
-            "confirmed"
-          );
-          if (sigs.length === 0) continue;
+          const sigs = await this.solanaRpcSingle<
+            Array<{ signature: string; err: unknown }>
+          >("getSignaturesForAddress", [addr, { limit: 15 }]);
+          if (!sigs || sigs.length === 0) continue;
 
           const latest = sigs[0].signature;
           const prev = this.solanaLastSigs.get(addr);
@@ -231,6 +229,31 @@ export class WalletWatcherService {
     } finally {
       this.solanaPollBusy = false;
     }
+  }
+
+  private async solanaRpcSingle<T>(method: string, params: unknown[]): Promise<T | null> {
+    const endpoints = [this.config.solanaRpcUrl];
+    if (!endpoints.includes("https://solana-rpc.publicnode.com")) {
+      endpoints.push("https://solana-rpc.publicnode.com");
+    }
+    for (const rpcUrl of endpoints) {
+      try {
+        const res = await fetch(rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+          signal: AbortSignal.timeout(8000)
+        });
+        if (!res.ok) continue;
+        const json = (await res.json()) as { result?: T; error?: unknown };
+        if (json.result !== undefined && !json.error) {
+          return json.result;
+        }
+      } catch {
+        // Try next RPC endpoint
+      }
+    }
+    return null;
   }
 
   async handleSolanaSignature(walletAddress: string, signature: string): Promise<void> {
@@ -317,10 +340,10 @@ export class WalletWatcherService {
     }
 
     try {
-      const parsedTx = await this.solanaClient.connection.getParsedTransaction(signature, {
-        maxSupportedTransactionVersion: 1 as 0,
-        commitment: "confirmed"
-      });
+      const parsedTx = await this.solanaRpcSingle<RawSolanaParsedTx>("getTransaction", [
+        signature,
+        { encoding: "jsonParsed", maxSupportedTransactionVersion: 1 }
+      ]);
       if (!parsedTx || !parsedTx.meta || parsedTx.meta.err) return null;
 
       const swap = this.extractSwapFromSolanaBalanceDiffs(walletAddress, signature, parsedTx);
@@ -334,24 +357,35 @@ export class WalletWatcherService {
     }
   }
 
+  private extractAccountKeys(parsedTx: RawSolanaParsedTx): string[] {
+    const baseKeys = (parsedTx.transaction?.message?.accountKeys ?? []).map((k) =>
+      typeof k === "string" ? k : typeof k.pubkey === "string" ? k.pubkey : k.pubkey?.toBase58?.() ?? ""
+    );
+    return [
+      ...baseKeys,
+      ...(parsedTx.meta?.loadedAddresses?.writable ?? []),
+      ...(parsedTx.meta?.loadedAddresses?.readonly ?? [])
+    ].filter(Boolean);
+  }
+
   private extractTransferFromSolanaBalanceDiffs(
     walletAddress: string,
     signature: string,
-    parsedTx: NonNullable<Awaited<ReturnType<SolanaClientManager["connection"]["getParsedTransaction"]>>>
+    parsedTx: RawSolanaParsedTx
   ): DetectedWalletTransfer | null {
     const meta = parsedTx.meta;
     if (!meta) return null;
-    const keys = parsedTx.transaction.message.accountKeys.map((k) => k.pubkey.toBase58() as string);
+    const keys = this.extractAccountKeys(parsedTx);
     const idx = keys.indexOf(walletAddress);
     if (idx < 0) return null;
 
-    const delta = Number(BigInt(meta.postBalances[idx] ?? 0) - BigInt(meta.preBalances[idx] ?? 0)) / 1e9;
+    const delta = Number(BigInt(meta.postBalances?.[idx] ?? 0) - BigInt(meta.preBalances?.[idx] ?? 0)) / 1e9;
     if (Math.abs(delta) < 0.05) return null;
 
     for (let i = 0; i < keys.length; i++) {
       const other = keys[i];
       if (!other || other === walletAddress || SOL_SYSTEM_SKIP.has(other)) continue;
-      const otherDelta = Number(BigInt(meta.postBalances[i] ?? 0) - BigInt(meta.preBalances[i] ?? 0)) / 1e9;
+      const otherDelta = Number(BigInt(meta.postBalances?.[i] ?? 0) - BigInt(meta.preBalances?.[i] ?? 0)) / 1e9;
       if (delta < -0.05 && otherDelta > 0.04) {
         return {
           chain: "solana",
@@ -457,7 +491,7 @@ export class WalletWatcherService {
   private extractSwapFromSolanaBalanceDiffs(
     walletAddress: string,
     signature: string,
-    parsedTx: NonNullable<Awaited<ReturnType<SolanaClientManager["connection"]["getParsedTransaction"]>>>
+    parsedTx: RawSolanaParsedTx
   ): DetectedWalletSwap | null {
     const meta = parsedTx.meta;
     if (!meta) return null;
@@ -470,13 +504,13 @@ export class WalletWatcherService {
     const postMap = new Map<string, bigint>();
 
     for (const b of meta.preTokenBalances ?? []) {
-      if (b.owner === walletAddress) {
-        preMap.set(b.mint, (preMap.get(b.mint) ?? 0n) + BigInt(b.uiTokenAmount.amount || "0"));
+      if (b.owner === walletAddress && b.mint) {
+        preMap.set(b.mint, (preMap.get(b.mint) ?? 0n) + BigInt(b.uiTokenAmount?.amount || "0"));
       }
     }
     for (const b of meta.postTokenBalances ?? []) {
-      if (b.owner === walletAddress) {
-        postMap.set(b.mint, (postMap.get(b.mint) ?? 0n) + BigInt(b.uiTokenAmount.amount || "0"));
+      if (b.owner === walletAddress && b.mint) {
+        postMap.set(b.mint, (postMap.get(b.mint) ?? 0n) + BigInt(b.uiTokenAmount?.amount || "0"));
       }
     }
 
@@ -499,11 +533,11 @@ export class WalletWatcherService {
     }
 
     // Native SOL delta on wallet's account index
-    const acctKeys = parsedTx.transaction.message.accountKeys;
-    const idx = acctKeys.findIndex((k) => k.pubkey.toBase58() === walletAddress);
+    const acctKeys = this.extractAccountKeys(parsedTx);
+    const idx = acctKeys.indexOf(walletAddress);
     let solDelta = 0n;
-    if (idx >= 0 && meta.preBalances[idx] !== undefined && meta.postBalances[idx] !== undefined) {
-      solDelta = BigInt(meta.postBalances[idx] - meta.preBalances[idx]);
+    if (idx >= 0 && meta.preBalances?.[idx] !== undefined && meta.postBalances?.[idx] !== undefined) {
+      solDelta = BigInt(meta.postBalances[idx]!) - BigInt(meta.preBalances[idx]!);
     }
 
     if (boughtMint && (solDelta < -100_000n || quoteSpent || soldMint !== null)) {
@@ -872,4 +906,20 @@ export class WalletWatcherService {
     }
     return false;
   }
+}
+
+interface RawSolanaParsedTx {
+  meta?: {
+    err?: unknown;
+    preBalances?: number[];
+    postBalances?: number[];
+    loadedAddresses?: { writable?: string[]; readonly?: string[] };
+    preTokenBalances?: Array<{ owner?: string; mint?: string; uiTokenAmount?: { amount?: string } }>;
+    postTokenBalances?: Array<{ owner?: string; mint?: string; uiTokenAmount?: { amount?: string } }>;
+  } | null;
+  transaction?: {
+    message?: {
+      accountKeys?: Array<string | { pubkey?: string | { toBase58?: () => string } }>;
+    };
+  };
 }

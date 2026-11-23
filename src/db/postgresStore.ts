@@ -1374,7 +1374,7 @@ export class PostgresUserVault implements IUserVault {
       skipIfHeld: Number(row.skip_if_held) === 1,
       mirrorSells: Number(row.mirror_sells) === 1,
       blockRisky: Number(row.block_risky) === 1,
-      transferAlerts: row.transfer_alerts === undefined ? true : Number(row.transfer_alerts) === 1,
+      transferAlerts: row.transfer_alerts === null || row.transfer_alerts === undefined ? true : Number(row.transfer_alerts) === 1,
       simMode: String(row.sim_mode) as SimMode,
       autoTpPct: row.auto_tp_pct !== null && row.auto_tp_pct !== undefined ? Number(row.auto_tp_pct) : null,
       autoSlPct: row.auto_sl_pct !== null && row.auto_sl_pct !== undefined ? Number(row.auto_sl_pct) : null,

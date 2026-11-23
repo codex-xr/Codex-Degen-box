@@ -150,7 +150,8 @@ const SOL_DEX_PROGRAMS = new Set([
   "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
   "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
   "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
-  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
+  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+  "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u"
 ]);
 
 const KNOWN_SOL_EXCHANGES: Record<string, string> = {
@@ -160,6 +161,8 @@ const KNOWN_SOL_EXCHANGES: Record<string, string> = {
   "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM": "Binance Hot",
   "2ojv9BAiHUrvsm9gxDe7fJSzbNZSJcxZvf8dqmWGHG8S": "Binance",
   "5VCwKtCXgCJ6kit5FybXjvriW3xELsFDhYrPSqtJNmcD": "OKX Hot",
+  ARu4n5mFdZogZAravu7CcizaojWnS6oqka37gdLT5SZn: "OKX Router",
+  AobVSwdW9BbpMdJvTqeCN4hPAmh4rHm7vwLnQ5ATSyrS: "Crypto.com Hot 2",
   AC5RDfQFmDS1deWZos921JfqscXdByf8BKHs5ACWjtW2: "Bybit Hot",
   FWznbcNXWQuHTawe9RxvQ2LdCENSSH12dsznf4RiouN5: "Kraken",
   BmFdpraQhkiDQE6SnfG5omcA1VwzqfXrwtNYBwWTymy6: "KuCoin"
@@ -725,6 +728,12 @@ export class WalletDetectiveService {
     for (let idx = 0; idx < personalBuddies.length; idx++) {
       await this.enrichSolanaBuddy(personalBuddies[idx], nativePriceUsd, days, idx < 2, address);
       await sleep(120);
+    }
+
+    if (KNOWN_SOL_EXCHANGES[address]) {
+      notes.unshift(
+        `Heads up: This is a known public Exchange / Router (${KNOWN_SOL_EXCHANGES[address]}), NOT an individual trader's wallet — watching it won't find personal buys!`
+      );
     }
 
     return {
