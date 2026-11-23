@@ -150,6 +150,7 @@ export interface WatchedWalletRow {
   skipIfHeld: boolean;
   mirrorSells: boolean;
   blockRisky: boolean;
+  transferAlerts: boolean;
   simMode: SimMode;
   autoTpPct: number | null;
   autoSlPct: number | null;
@@ -225,6 +226,7 @@ export interface IUserVault {
   getBalances(): Promise<VirtualBalanceRow[]>;
   getBalance(chain: ChainKey): Promise<VirtualBalanceRow>;
   setVirtualFunds(chain: ChainKey, newBalanceAtomic: bigint, resetInitial?: boolean): Promise<void>;
+  addVirtualFunds(chain: ChainKey, addAtomic: bigint): Promise<bigint>;
   adjustBalance(chain: ChainKey, deltaAtomic: bigint): Promise<bigint>;
   getSettings(): Promise<UserSettings>;
   setSetting(key: string, value: string): Promise<void>;
@@ -294,6 +296,7 @@ export interface IUserVault {
     skipIfHeld?: boolean;
     mirrorSells?: boolean;
     blockRisky?: boolean;
+    transferAlerts?: boolean;
     simMode?: SimMode;
     autoTpPct?: number | null;
     autoSlPct?: number | null;
@@ -315,6 +318,7 @@ export interface IUserVault {
       skipIfHeld: boolean;
       mirrorSells: boolean;
       blockRisky: boolean;
+      transferAlerts: boolean;
       simMode: SimMode;
       autoTpPct: number | null;
       autoSlPct: number | null;

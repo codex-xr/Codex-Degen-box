@@ -1,16 +1,16 @@
 # 🏴‍☠️ Codex Degen Box
 
-A private cabal Telegram demo trading & copy-alpha bot supporting **Solana**, **Base**, and **Robinhood Chain (`4663`)** — with **100% isolated private storage per user**, admin-generated invite codes, exact lowest-decimal virtual funds, instant wallet copy-trading, PNG PnL cards, and weekly pattern-recognition intelligence reports.
+A private cabal Telegram demo trading, wallet detective & copy-alpha bot supporting **Solana**, **Ethereum (EVM)**, **Base (`8453`)**, and **Robinhood Chain (`4663`)** — with **100% isolated private storage per user**, admin-generated invite codes, exact lowest-decimal virtual funds with live USDT conversion, instant wallet copy-trading + funding alerts, wallet-by-wallet reports, on-chain Wallet Detective dossiers + PNG cards, and pattern-recognition intelligence.
 
 ## Key Features
 
 - **Private Invite Codes:** Only the admin generates invite passes (`/gencode` or Admin Panel) for up to 10 cabal members.
 - **Strict Private Vault Per User:** Supports **Supabase / Postgres** (each user gets their own separate private schema `user_<telegram_id>`) or local **SQLite** (separate `data/users/<telegram_id>.db` files) — zero shared trading data between users.
-- **Exact Lowest-Decimal Virtual Funds:** Set custom starting virtual money per chain down to 1 lamport (`0.000000001 SOL`) or 1 wei (`0.000000000000000001 ETH`).
+- **Exact Lowest-Decimal Virtual Funds + Live USDT Calculator:** Add virtual funds directly in SOL/ETH OR enter an exact **USDT dollar amount** converted live down to 1 lamport (`0.000000001 SOL`) or 1 wei (`0.000000000000000001 ETH`).
 - **Full Degen Trading Controls (Demo):** Paste any token address to scan live price, MC, liquidity, 5m volume, age, and GoPlus/RugCheck safety flags, then execute quick buys, custom exact buys, limit buys, DCA, take-profit, stop-loss, and trailing stops with liquidity-aware slippage and rug detection.
-- **Instant Wallet Watching & Copy-Trading:** Watch any wallet on Solana, Base, or Robinhood Chain, choose exact copy amounts from your balance (or `%`), filter by MC/liquidity/safety, mirror sells, and compare Realistic delay vs. Ideal fills.
-- **PNG PnL Cards:** Auto-generated shareable PnL image cards with selectable themes.
-- **Weekly Alpha & Pattern Report:** Ranks watched wallets by net profit, breaks down chain performance, scores wallet copyability (0–100), and identifies winning MC/age/hold-time patterns.
+- **Wallet Detective Investigation (Paste Any Wallet OR Weekly Report):** Paste any Solana or EVM (`0x...`) wallet address to inspect top connected wallets, money flow arrows, 7-day activity & trading style, existing balances & coins held, launched coins (Pump.fun & EVM contracts), linked Twitter/X & domains, cross-chain twin wallets, first funder, and 2-hop middleman links — plus shareable **Detective PNG Cards**.
+- **Instant Wallet Watching, Naming & Funding Alerts:** Name/rename any watched wallet, choose exact copy amounts (or `0` for Alert & Investigate Only mode), get live alerts whenever a watched storage wallet funds a new wallet, and inspect weekly reports **wallet by wallet**.
+- **PNG PnL Cards:** Auto-generated shareable PnL & Detective image cards with selectable themes.
 
 ## 24/7 Free Cloud Hosting (Render + Supabase + Wake-Up Ping)
 

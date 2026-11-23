@@ -7,8 +7,8 @@ import {
   PublicClient,
   webSocket
 } from "viem";
-import { base } from "viem/chains";
-import { ChainKey } from "../chains/registry.js";
+import { base, mainnet } from "viem/chains";
+import { ChainKey, EvmChainKey, isEvmChainKey } from "../chains/registry.js";
 import { AppConfig } from "../config.js";
 
 export const robinhoodChain = defineChain({
@@ -27,6 +27,7 @@ export const robinhoodChain = defineChain({
 });
 
 export class EvmClientManager {
+  private readonly ethClient: PublicClient;
   private readonly baseClient: PublicClient;
   private readonly robinhoodClient: PublicClient;
   private readonly config: AppConfig;
@@ -34,6 +35,10 @@ export class EvmClientManager {
 
   constructor(config: AppConfig) {
     this.config = config;
+    this.ethClient = createPublicClient({
+      chain: mainnet,
+      transport: http(config.ethRpcUrl, { timeout: 10_000, retryCount: 2 })
+    }) as PublicClient;
     this.baseClient = createPublicClient({
       chain: base,
       transport: http(config.baseRpcUrl, { timeout: 10_000, retryCount: 2 })
@@ -50,16 +55,23 @@ export class EvmClientManager {
     }) as PublicClient;
   }
 
-  getClient(chain: "base" | "robinhood"): PublicClient {
+  getClient(chain: EvmChainKey): PublicClient {
+    if (chain === "ethereum") return this.ethClient;
     return chain === "base" ? this.baseClient : this.robinhoodClient;
   }
 
-  createWsClient(chain: "base" | "robinhood"): PublicClient | null {
-    const wsUrl = chain === "base" ? this.config.baseWsUrl : this.config.robinhoodWsUrl;
+  createWsClient(chain: EvmChainKey): PublicClient | null {
+    const wsUrl =
+      chain === "ethereum"
+        ? this.config.ethWsUrl
+        : chain === "base"
+          ? this.config.baseWsUrl
+          : this.config.robinhoodWsUrl;
     if (!wsUrl) return null;
     try {
+      const viemChain = chain === "ethereum" ? mainnet : chain === "base" ? base : robinhoodChain;
       return createPublicClient({
-        chain: chain === "base" ? base : robinhoodChain,
+        chain: viemChain,
         transport: webSocket(wsUrl, { reconnect: { attempts: 10, delay: 3000 } })
       }) as PublicClient;
     } catch {
@@ -67,7 +79,15 @@ export class EvmClientManager {
     }
   }
 
-  async getTokenDecimals(chain: "base" | "robinhood", tokenAddress: string): Promise<number> {
+  async getNativeBalance(chain: EvmChainKey, address: string): Promise<bigint | null> {
+    try {
+      return await this.getClient(chain).getBalance({ address: address as `0x${string}` });
+    } catch {
+      return null;
+    }
+  }
+
+  async getTokenDecimals(chain: EvmChainKey, tokenAddress: string): Promise<number> {
     const cacheKey = `${chain}:${tokenAddress.toLowerCase()}`;
     const cached = this.decimalsCache.get(cacheKey);
     if (cached !== undefined) return cached;
@@ -85,13 +105,18 @@ export class EvmClientManager {
         return num;
       }
     } catch {
-      // Fallback to Blockscout API on Robinhood Chain if RPC fails
-      if (chain === "robinhood") {
+      // Fallback to Blockscout API on Robinhood / Ethereum if RPC fails
+      const bsHost =
+        chain === "robinhood"
+          ? "https://robinhoodchain.blockscout.com"
+          : chain === "ethereum"
+            ? "https://eth.blockscout.com"
+            : null;
+      if (bsHost) {
         try {
-          const res = await fetch(
-            `https://robinhoodchain.blockscout.com/api/v2/tokens/${tokenAddress}`,
-            { signal: AbortSignal.timeout(5000) }
-          );
+          const res = await fetch(`${bsHost}/api/v2/tokens/${tokenAddress}`, {
+            signal: AbortSignal.timeout(5000)
+          });
           if (res.ok) {
             const json = (await res.json()) as { decimals?: string | number };
             const num = Number(json.decimals);
@@ -109,7 +134,7 @@ export class EvmClientManager {
   }
 
   async getTokenMetadata(
-    chain: "base" | "robinhood",
+    chain: EvmChainKey,
     tokenAddress: string
   ): Promise<{ symbol: string; name: string; decimals: number } | null> {
     try {
@@ -126,7 +151,7 @@ export class EvmClientManager {
     }
   }
 
-  isEvmChain(chain: ChainKey): chain is "base" | "robinhood" {
-    return chain === "base" || chain === "robinhood";
+  isEvmChain(chain: ChainKey): chain is EvmChainKey {
+    return isEvmChainKey(chain);
   }
 }

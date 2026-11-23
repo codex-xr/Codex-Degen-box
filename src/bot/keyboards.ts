@@ -1,5 +1,5 @@
 import { InlineKeyboard } from "grammy";
-import { CHAIN_LIST, ChainKey, CHAINS } from "../chains/registry.js";
+import { CHAIN_LIST, ChainKey, CHAINS, EVM_CHAIN_KEYS, shortAddress } from "../chains/registry.js";
 import { PnlTheme, PositionRow, UserSettings, WatchedWalletRow } from "../db/userVault.js";
 import { formatShortTokenLabel } from "./formatters.js";
 
@@ -16,11 +16,13 @@ export function buildHomeKeyboard(isAdmin: boolean): InlineKeyboard {
     .text("👁️ Watch Wallets (Copy)", "nav:watchers")
     .text("📊 Weekly Alpha Report", "nav:report")
     .row()
+    .text("🕵️ Investigate Any Wallet", "det:ask")
     .text("⚙️ Settings", "nav:settings")
+    .row()
     .text("❓ How It Works", "nav:help");
 
   if (isAdmin) {
-    kb.row().text("🔑 Admin Panel (Invite Codes)", "nav:admin");
+    kb.text("🔑 Admin Panel (Invite Codes)", "nav:admin");
   }
   return kb;
 }
@@ -28,23 +30,29 @@ export function buildHomeKeyboard(isAdmin: boolean): InlineKeyboard {
 export function buildFundsKeyboard(): InlineKeyboard {
   const kb = new InlineKeyboard();
   for (const c of CHAIN_LIST) {
-    kb.text(`${c.emoji} Edit ${c.name}`, `funds:pick:${c.key}`).row();
+    kb.text(`${c.emoji} Add / Edit ${c.name}`, `funds:pick:${c.key}`).row();
   }
   kb.text("🏠 Main Menu", "nav:home");
   return kb;
 }
 
-export function buildEditChainFundsKeyboard(chain: ChainKey): InlineKeyboard {
+export function buildEditChainFundsKeyboard(chain: ChainKey, nativePriceUsd = 0): InlineKeyboard {
   const spec = CHAINS[chain];
   const presets = chain === "solana" ? ["1", "5", "10", "50"] : ["0.1", "0.5", "1", "5"];
   const kb = new InlineKeyboard();
   for (const amt of presets) {
-    kb.text(`${amt} ${spec.nativeSymbol}`, `funds:set:${chain}:${amt}`);
+    const num = Number(amt);
+    const usdHint =
+      nativePriceUsd > 0 ? ` (~$${Math.round(num * nativePriceUsd).toLocaleString("en-US")})` : "";
+    kb.text(`+${amt} ${spec.nativeSymbol}${usdHint}`, `funds:add:${chain}:${amt}`);
   }
   kb.row()
-    .text("✏️ Type Exact Amount (Any Decimal)", `funds:custom:${chain}`)
+    .text("💵 Add by USDT Value", `funds:addusd:${chain}`)
+    .text(`➕ Add Exact ${spec.nativeSymbol}`, `funds:addnative:${chain}`)
     .row()
+    .text(`✏️ Set Exact Total`, `funds:custom:${chain}`)
     .text("🗑️ Reset to 0", `funds:set:${chain}:0`)
+    .row()
     .text("⬅️ Back", "nav:funds");
   return kb;
 }
@@ -151,35 +159,104 @@ export function buildWatchChainPickKeyboard(): InlineKeyboard {
 export function buildWatcherDetailKeyboard(w: WatchedWalletRow): InlineKeyboard {
   return new InlineKeyboard()
     .text(w.enabled ? "⏸️ Pause Watching" : "▶️ Resume Watching", `watch:toggle:${w.id}:enabled`)
-    .text("💵 Change Copy Amount", `watch:editamt:${w.id}`)
+    .text("✏️ Rename Wallet", `watch:rename:${w.id}`)
     .row()
+    .text("💵 Copy Amount", `watch:editamt:${w.id}`)
+    .text("🔍 Weekly Report", `report:wallet:${w.id}:7`)
+    .row()
+    .text(`🚨 Funding Alerts: ${w.transferAlerts ? "ON" : "OFF"}`, `watch:toggle:${w.id}:transferAlerts`)
     .text(`🔁 Mirror Sells: ${w.mirrorSells ? "ON" : "OFF"}`, `watch:toggle:${w.id}:mirrorSells`)
-    .text(`🛡️ Block Risky: ${w.blockRisky ? "ON" : "OFF"}`, `watch:toggle:${w.id}:blockRisky`)
     .row()
+    .text(`🛡️ Block Risky: ${w.blockRisky ? "ON" : "OFF"}`, `watch:toggle:${w.id}:blockRisky`)
     .text(`⚡ Skip Held: ${w.skipIfHeld ? "ON" : "OFF"}`, `watch:toggle:${w.id}:skipIfHeld`)
+    .row()
     .text(
       `⏱️ Sim: ${w.simMode === "realistic" ? "Realistic" : "Ideal"}`,
       `watch:toggle:${w.id}:simMode`
     )
+    .text("🎯 Set Auto TP/SL", `watch:filter:${w.id}:tp_sl`)
     .row()
     .text("📏 Min MC", `watch:filter:${w.id}:min_mc`)
     .text("📏 Max MC", `watch:filter:${w.id}:max_mc`)
     .text("💧 Min Liq", `watch:filter:${w.id}:min_liq`)
     .row()
-    .text("🎯 Set Auto TP/SL", `watch:filter:${w.id}:tp_sl`)
     .text("🗑️ Delete Watcher", `watch:del:${w.id}`)
-    .row()
-    .text("⬅️ All Watched Wallets", "nav:watchers");
+    .text("⬅️ All Watched", "nav:watchers");
 }
 
-export function buildReportKeyboard(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("📅 Generate 7-Day Alpha Report", "report:run:7")
+export function buildReportKeyboard(wallets: WatchedWalletRow[] = []): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  for (const w of wallets.slice(0, 12)) {
+    kb.text(`${CHAINS[w.chain].emoji} ${w.alias} (${CHAINS[w.chain].shortBadge})`, `report:wallet:${w.id}:7`).row();
+  }
+  kb.text("🕵️ Investigate Any Address", "det:ask")
     .row()
-    .text("⚡ 24-Hour Report", "report:run:1")
-    .text("📆 30-Day Report", "report:run:30")
+    .text("📋 Overall Vault Summary (7d)", "report:run:7")
+    .text("📆 30d Overall", "report:run:30")
     .row()
     .text("🏠 Main Menu", "nav:home");
+  return kb;
+}
+
+export function buildWalletReportKeyboard(params: {
+  walletId: number;
+  days: number;
+  cardRefId: string;
+  buddyRefs: Array<{ address: string; roleBadge: string; refId: string }>;
+}): InlineKeyboard {
+  const kb = new InlineKeyboard()
+    .text(params.days === 1 ? "• 24h •" : "⚡ 24h", `report:wallet:${params.walletId}:1`)
+    .text(params.days === 7 ? "• 7d •" : "📅 7d", `report:wallet:${params.walletId}:7`)
+    .text(params.days === 30 ? "• 30d •" : "📆 30d", `report:wallet:${params.walletId}:30`)
+    .row()
+    .text("🖼️ Detective Card (PNG)", `det:card:${params.cardRefId}`)
+    .row();
+
+  for (const b of params.buddyRefs.slice(0, 3)) {
+    const short = shortAddress(b.address, 4, 4);
+    kb.text(`🔍 Check ${short}`, `det:go:${b.refId}`)
+      .text(`👁️ Watch ${short}`, `det:watch:${b.refId}`)
+      .row();
+  }
+
+  kb.text("⬅️ Pick Another Wallet", "nav:report").text("🏠 Main Menu", "nav:home");
+  return kb;
+}
+
+export function buildDetectiveKeyboard(params: {
+  cardRefId: string;
+  watchRefId: string;
+  chain: ChainKey;
+  address: string;
+  days: number;
+  buddyRefs: Array<{ address: string; refId: string }>;
+}): InlineKeyboard {
+  const kb = new InlineKeyboard()
+    .text("🖼️ Detective Card (PNG)", `det:card:${params.cardRefId}`)
+    .text("👁️ Watch This Wallet", `det:watch:${params.watchRefId}`)
+    .row()
+    .text(params.days === 1 ? "• 24h •" : "⚡ 24h", `det:days:${params.cardRefId}:1`)
+    .text(params.days === 7 ? "• 7d •" : "📅 7d", `det:days:${params.cardRefId}:7`)
+    .text(params.days === 30 ? "• 30d •" : "📆 30d", `det:days:${params.cardRefId}:30`)
+    .row();
+
+  if (CHAINS[params.chain].vm === "evm") {
+    for (const c of EVM_CHAIN_KEYS) {
+      const label = c === params.chain ? `• ${CHAINS[c].shortBadge} •` : `${CHAINS[c].emoji} ${CHAINS[c].shortBadge}`;
+      kb.text(label, `det:evm:${params.cardRefId}:${c}`);
+    }
+    kb.row();
+  }
+
+  for (const b of params.buddyRefs.slice(0, 3)) {
+    const short = shortAddress(b.address, 4, 4);
+    kb.text(`🔍 ${short}`, `det:go:${b.refId}`)
+      .text(`👁️ Watch ${short}`, `det:watch:${b.refId}`)
+      .row();
+  }
+
+  kb.text("📊 Wallet Reports", "nav:report").text("🏠 Main Menu", "nav:home");
+  return kb;
 }
 
 export function buildSettingsKeyboard(settings: UserSettings): InlineKeyboard {

@@ -53,7 +53,7 @@ export async function formatHomeMessage(vault: IUserVault, isAdmin: boolean): Pr
     }*`
   );
   lines.push("");
-  lines.push("💡 _Tip: Paste any token address right here in chat to scan & paper-trade it!_");
+  lines.push("💡 _Tip: Paste any token OR wallet address right here in chat to trade or investigate it!_");
 
   return lines.join("\n");
 }
@@ -168,7 +168,9 @@ export function formatWatchedWalletMessage(w: WatchedWalletRow): string {
   const spec = CHAINS[w.chain];
   const copyAmtStr =
     w.copyMode === "fixed"
-      ? `${formatExactUnits(w.copyAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol} per trade`
+      ? w.copyAmountAtomic <= 0n
+        ? "0 (Watch & Alert Only — no auto buys)"
+        : `${formatExactUnits(w.copyAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol} per trade`
       : `${w.copyPercent}% of balance per trade`;
 
   const lines: string[] = [
@@ -177,6 +179,7 @@ export function formatWatchedWalletMessage(w: WatchedWalletRow): string {
     `Address: \`${w.address}\``,
     "",
     `💵 *Copy Size:* \`${copyAmtStr}\``,
+    `🚨 Funding / Transfer Alerts: *${w.transferAlerts ? "Yes" : "No"}*`,
     `🔁 Mirror Sells: *${w.mirrorSells ? "Yes" : "No"}*`,
     `🛡️ Block Risky/Honeypots: *${w.blockRisky ? "Yes" : "No"}*`,
     `⚡ Skip If Already Holding: *${w.skipIfHeld ? "Yes" : "No"}*`,

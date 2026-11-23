@@ -28,8 +28,12 @@ export interface AppConfig {
   userVaultDir: string;
   databaseUrl: string;
   heliusApiKey: string;
+  alchemyApiKey: string;
+  blockscoutApiKey: string;
   solanaRpcUrl: string;
   solanaWsUrl: string;
+  ethRpcUrl: string;
+  ethWsUrl: string;
   baseRpcUrl: string;
   baseWsUrl: string;
   robinhoodRpcUrl: string;
@@ -50,6 +54,8 @@ export interface AppConfig {
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   const dataDir = path.resolve(overrides.dataDir ?? process.env.DATA_DIR ?? "./data");
   const heliusApiKey = (overrides.heliusApiKey ?? process.env.HELIUS_API_KEY ?? "").trim();
+  const alchemyApiKey = (overrides.alchemyApiKey ?? process.env.ALCHEMY_API_KEY ?? "").trim();
+  const blockscoutApiKey = (overrides.blockscoutApiKey ?? process.env.BLOCKSCOUT_API_KEY ?? "").trim();
 
   const defaultSolRpc = heliusApiKey
     ? `https://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`
@@ -57,6 +63,18 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   const defaultSolWs = heliusApiKey
     ? `wss://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`
     : "wss://api.mainnet-beta.solana.com";
+  const defaultEthRpc = alchemyApiKey
+    ? `https://eth-mainnet.g.alchemy.com/v2/${alchemyApiKey}`
+    : "https://ethereum-rpc.publicnode.com";
+  const defaultEthWs = alchemyApiKey
+    ? `wss://eth-mainnet.g.alchemy.com/v2/${alchemyApiKey}`
+    : "wss://ethereum-rpc.publicnode.com";
+  const defaultBaseRpc = alchemyApiKey
+    ? `https://base-mainnet.g.alchemy.com/v2/${alchemyApiKey}`
+    : "https://mainnet.base.org";
+  const defaultBaseWs = alchemyApiKey
+    ? `wss://base-mainnet.g.alchemy.com/v2/${alchemyApiKey}`
+    : "wss://base-rpc.publicnode.com";
 
   return {
     botToken: (overrides.botToken ?? process.env.TELEGRAM_BOT_TOKEN ?? "").trim(),
@@ -68,10 +86,14 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     userVaultDir: overrides.userVaultDir ?? path.join(dataDir, "users"),
     databaseUrl: (overrides.databaseUrl ?? process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? "").trim(),
     heliusApiKey,
+    alchemyApiKey,
+    blockscoutApiKey,
     solanaRpcUrl: (overrides.solanaRpcUrl ?? process.env.SOLANA_RPC_URL ?? defaultSolRpc).trim(),
     solanaWsUrl: (overrides.solanaWsUrl ?? process.env.SOLANA_WS_URL ?? defaultSolWs).trim(),
-    baseRpcUrl: (overrides.baseRpcUrl ?? process.env.BASE_RPC_URL ?? "https://mainnet.base.org").trim(),
-    baseWsUrl: (overrides.baseWsUrl ?? process.env.BASE_WS_URL ?? "wss://base-rpc.publicnode.com").trim(),
+    ethRpcUrl: (overrides.ethRpcUrl ?? process.env.ETH_RPC_URL ?? defaultEthRpc).trim(),
+    ethWsUrl: (overrides.ethWsUrl ?? process.env.ETH_WS_URL ?? defaultEthWs).trim(),
+    baseRpcUrl: (overrides.baseRpcUrl ?? process.env.BASE_RPC_URL ?? defaultBaseRpc).trim(),
+    baseWsUrl: (overrides.baseWsUrl ?? process.env.BASE_WS_URL ?? defaultBaseWs).trim(),
     robinhoodRpcUrl: (
       overrides.robinhoodRpcUrl ??
       process.env.ROBINHOOD_RPC_URL ??

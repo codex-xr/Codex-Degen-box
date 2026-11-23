@@ -15,9 +15,22 @@ import { MarketDataService, TokenSnapshot } from "../services/marketData.js";
 import { PnlCardRenderer } from "../services/pnlCard.js";
 import { SecurityService } from "../services/security.js";
 import { ExecutionResult, TradingEngine } from "../services/tradingEngine.js";
+import {
+  WalletDetectiveService,
+  WalletInvestigationReport
+} from "../services/walletDetective.js";
 import { WalletWatcherService } from "../services/walletWatcher.js";
-import { WeeklyReportService } from "../services/weeklyReport.js";
-import { formatExactUnits, formatUsd, parseExactUnits } from "../utils/amounts.js";
+import {
+  formatDetectiveReportMessage,
+  WeeklyReportService
+} from "../services/weeklyReport.js";
+import {
+  formatExactUnits,
+  formatUsd,
+  nativeAtomicToUsd,
+  parseExactUnits,
+  usdToNativeAtomic
+} from "../utils/amounts.js";
 import {
   escapeMd,
   formatHomeMessage,
@@ -27,6 +40,7 @@ import {
 } from "./formatters.js";
 import {
   buildAdminKeyboard,
+  buildDetectiveKeyboard,
   buildDisambiguateChainKeyboard,
   buildEditChainFundsKeyboard,
   buildFundsKeyboard,
@@ -37,6 +51,7 @@ import {
   buildReportKeyboard,
   buildSettingsKeyboard,
   buildTokenTradeKeyboard,
+  buildWalletReportKeyboard,
   buildWatchChainPickKeyboard,
   buildWatcherDetailKeyboard,
   buildWatchersKeyboard
@@ -51,14 +66,50 @@ export interface BotServices {
   security: SecurityService;
   trading: TradingEngine;
   pnlCards: PnlCardRenderer;
+  detective: WalletDetectiveService;
   weeklyReports: WeeklyReportService;
   walletWatcher: WalletWatcherService;
+}
+
+const SHORT_CHAIN_MAP: Record<string, ChainKey> = {
+  s: "solana",
+  e: "ethereum",
+  b: "base",
+  r: "robinhood"
+};
+
+export function shortChainCode(chain: ChainKey): string {
+  if (chain === "solana") return "s";
+  if (chain === "ethereum") return "e";
+  if (chain === "base") return "b";
+  return "r";
+}
+
+function splitTelegramChunks(text: string, maxLen = 3800): string[] {
+  if (text.length <= maxLen) return [text];
+  const chunks: string[] = [];
+  const lines = text.split("\n");
+  let current = "";
+  for (const line of lines) {
+    if (current.length + line.length + 1 > maxLen && current.length > 0) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = current ? `${current}\n${line}` : line;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
 }
 
 export function createTelegramBot(services: BotServices): Bot {
   const bot = new Bot(services.config.botToken);
   const sessions = new SessionStore();
   const tokenRefs = new Map<string, { chain: ChainKey; address: string }>();
+  const detectiveRefs = new Map<
+    string,
+    { chain: ChainKey; address: string; alias?: string; report?: WalletInvestigationReport }
+  >();
 
   const registerTokenRef = (chain: ChainKey, address: string): string => {
     const norm = normalizeAddress(chain, address);
@@ -67,6 +118,21 @@ export function createTelegramBot(services: BotServices): Bot {
     if (tokenRefs.size > 4000) {
       const oldest = tokenRefs.keys().next().value;
       if (oldest) tokenRefs.delete(oldest);
+    }
+    return id;
+  };
+
+  const registerDetectiveRef = (
+    chain: ChainKey,
+    address: string,
+    extra: { alias?: string; report?: WalletInvestigationReport } = {}
+  ): string => {
+    const norm = normalizeAddress(chain, address);
+    const id = crypto.createHash("sha256").update(`det:${chain}:${norm}`).digest("hex").slice(0, 10);
+    detectiveRefs.set(id, { chain, address: norm, ...extra });
+    if (detectiveRefs.size > 2500) {
+      const oldest = detectiveRefs.keys().next().value;
+      if (oldest) detectiveRefs.delete(oldest);
     }
     return id;
   };
@@ -86,6 +152,13 @@ export function createTelegramBot(services: BotServices): Bot {
         reply_markup: kb,
         link_preview_options: { is_disabled: true }
       });
+    }
+  };
+
+  const safeReplyChunks = async (ctx: Context, text: string, kb?: InlineKeyboard) => {
+    const chunks = splitTelegramChunks(text);
+    for (let i = 0; i < chunks.length; i++) {
+      await safeReply(ctx, chunks[i], i === chunks.length - 1 ? kb : undefined);
     }
   };
 
@@ -149,6 +222,58 @@ export function createTelegramBot(services: BotServices): Bot {
     else await safeReply(ctx, text, kb);
   };
 
+  const buildBuddyButtonsForReport = async (
+    vault: IUserVault,
+    report: WalletInvestigationReport
+  ): Promise<Array<{ address: string; roleBadge: string; refId: string }>> => {
+    const existingWatched = new Set(
+      (await vault.listWatchedWallets(false)).map((w) => normalizeAddress(w.chain, w.address))
+    );
+    const out: Array<{ address: string; roleBadge: string; refId: string }> = [];
+    for (const b of report.connectedWallets) {
+      if (b.isExchangeOrApp) continue;
+      if (existingWatched.has(normalizeAddress(report.chain, b.address))) continue;
+      out.push({
+        address: b.address,
+        roleBadge: b.roleBadge,
+        refId: registerDetectiveRef(report.chain, b.address, { alias: b.label ?? undefined })
+      });
+      if (out.length >= 3) break;
+    }
+    return out;
+  };
+
+  const runAndSendWalletDetective = async (
+    ctx: Context,
+    vault: IUserVault,
+    params: { chain: ChainKey | "evm_auto"; address: string; days: number; alias?: string }
+  ) => {
+    await safeReply(
+      ctx,
+      `🕵️‍♂️ Investigating \`${shortAddress(params.address, 6, 4)}\` (${params.days}d transfers, balances, launched coins & Twitter)...`
+    );
+    const report =
+      params.chain === "evm_auto"
+        ? await services.detective.investigateEvmAuto(params.address, params.days)
+        : await services.detective.investigateWallet(params.chain, params.address, params.days);
+
+    const cardRefId = registerDetectiveRef(report.chain, report.address, {
+      alias: params.alias,
+      report
+    });
+    const buddyRefs = await buildBuddyButtonsForReport(vault, report);
+    const msg = formatDetectiveReportMessage(report, params.alias);
+    const kb = buildDetectiveKeyboard({
+      cardRefId,
+      watchRefId: cardRefId,
+      chain: report.chain,
+      address: report.address,
+      days: report.days,
+      buddyRefs
+    });
+    await safeReplyChunks(ctx, msg, kb);
+  };
+
   const scanAddressInput = async (
     ctx: Context,
     telegramId: string,
@@ -160,9 +285,26 @@ export function createTelegramBot(services: BotServices): Bot {
     const snaps = await services.market.lookupToken(detected, trimmed, 2000);
 
     if (snaps.length === 0) {
+      const vault = await services.vaultManager.getVault(telegramId);
+      if (isValidAddressFormat("solana", trimmed) && (!preferredChain || preferredChain === "solana")) {
+        await runAndSendWalletDetective(ctx, vault, {
+          chain: "solana",
+          address: trimmed,
+          days: 7
+        });
+        return;
+      }
+      if (/^0x[a-fA-F0-9]{40}$/.test(trimmed)) {
+        await runAndSendWalletDetective(ctx, vault, {
+          chain: preferredChain && preferredChain !== "solana" ? preferredChain : "evm_auto",
+          address: trimmed,
+          days: 7
+        });
+        return;
+      }
       await safeReply(
         ctx,
-        "❌ Couldn't find a live trading pool for that token address on *Solana*, *Base*, or *Robinhood Chain*."
+        "❌ Couldn't find a coin or valid wallet address there. Paste any Solana or EVM (`0x...`) coin or wallet address!"
       );
       return;
     }
@@ -320,7 +462,7 @@ export function createTelegramBot(services: BotServices): Bot {
   bot.command("report", async (ctx) => {
     const ok = await requireAuthorized(ctx);
     if (!ok) return;
-    await safeReply(ctx, "📊 *Weekly Alpha & Pattern Report*\nPick a time window:", buildReportKeyboard());
+    await showReportMenuScreen(ok.vault, ctx, false);
   });
 
   bot.command("settings", async (ctx) => {
@@ -419,17 +561,48 @@ export function createTelegramBot(services: BotServices): Bot {
   // === Helper Screens ===
 
   const showFundsScreen = async (vault: IUserVault, ctx: Context, edit: boolean) => {
-    const balances = await vault.getBalances();
+    const [balances, solUsd, ethUsd] = await Promise.all([
+      vault.getBalances(),
+      services.market.getNativePriceUsd("solana").catch(() => 0),
+      services.market.getNativePriceUsd("ethereum").catch(() => 0)
+    ]);
     const lines = [
       "💰 *Your Virtual Play Money*",
-      "_Pick any chain below to type in your exact starting balance (even tiny decimals!)._",
+      "_Pick any chain below to ADD funds (in SOL/ETH or by exact USDT dollar amount!) or set a new total._",
       ""
     ];
-    for (const b of balances) {
-      const spec = CHAINS[b.chain];
-      lines.push(`${spec.emoji} *${spec.name}:* \`${formatExactUnits(b.balanceAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\``);
+    for (const c of [CHAINS.solana, CHAINS.ethereum, CHAINS.base, CHAINS.robinhood]) {
+      const b = balances.find((row) => row.chain === c.key);
+      const atomic = b?.balanceAtomic ?? 0n;
+      const usdPrice = c.key === "solana" ? solUsd : ethUsd;
+      const usdVal = nativeAtomicToUsd(atomic, c.nativeDecimals, usdPrice);
+      const usdStr = usdPrice > 0 ? ` (~*${formatUsd(usdVal)} USDT*)` : "";
+      lines.push(
+        `${c.emoji} *${c.name}:* \`${formatExactUnits(atomic, c.nativeDecimals)} ${c.nativeSymbol}\`${usdStr}`
+      );
+    }
+    if (solUsd > 0 || ethUsd > 0) {
+      lines.push("");
+      lines.push(
+        `📊 _Live rates:_ ${solUsd > 0 ? `1 SOL ≈ ${formatUsd(solUsd)}` : ""}${
+          solUsd > 0 && ethUsd > 0 ? "  |  " : ""
+        }${ethUsd > 0 ? `1 ETH ≈ ${formatUsd(ethUsd)}` : ""}`
+      );
     }
     const kb = buildFundsKeyboard();
+    if (edit) await safeEditOrReply(ctx, lines.join("\n"), kb);
+    else await safeReply(ctx, lines.join("\n"), kb);
+  };
+
+  const showReportMenuScreen = async (vault: IUserVault, ctx: Context, edit: boolean) => {
+    const wallets = await vault.listWatchedWallets(false);
+    const lines = [
+      "📊 *Wallet-by-Wallet Weekly Report & Detective*",
+      wallets.length > 0
+        ? "_Pick ONE watched wallet below to see its full report & connected wallets — then you can pick the next one!_"
+        : "_You don't have any watched wallets yet — tap *Investigate Any Address* or watch a wallet first!_"
+    ];
+    const kb = buildReportKeyboard(wallets);
     if (edit) await safeEditOrReply(ctx, lines.join("\n"), kb);
     else await safeReply(ctx, lines.join("\n"), kb);
   };
@@ -465,8 +638,8 @@ export function createTelegramBot(services: BotServices): Bot {
   const showWatchersScreen = async (vault: IUserVault, ctx: Context, edit: boolean) => {
     const watchers = await vault.listWatchedWallets(false);
     const lines = [
-      "👁️ *Instant Wallet Copy-Trading*",
-      "_Watch any wallet on Solana, Base, or Robinhood Chain. The exact second it trades, your virtual vault copies it automatically!_",
+      "👁️ *Instant Wallet Copy-Trading & Alerts*",
+      "_Watch any wallet on Solana, Ethereum, Base, or Robinhood Chain. Get instant copy trades OR funding movement alerts!_",
       ""
     ];
     if (watchers.length === 0) {
@@ -504,11 +677,12 @@ export function createTelegramBot(services: BotServices): Bot {
   const showHelpScreen = async (ctx: Context, edit: boolean) => {
     const text =
       `❓ *How To Use Codex Degen Box (Simple Guide)*\n\n` +
-      `1️⃣ *Add Play Money:* Tap *Virtual Funds*, pick Solana, Base, or Robinhood Chain, and type any starting amount you want.\n` +
+      `1️⃣ *Add Play Money:* Tap *Virtual Funds*, pick Solana, Ethereum, Base, or Robinhood Chain, and add by SOL/ETH or exact USDT dollar value!\n` +
       `2️⃣ *Buy Any Coin:* Just paste any coin address right into this chat! You'll get a safety check and quick Buy buttons.\n` +
-      `3️⃣ *Copy Any Wallet Live:* Tap *Watch Wallets*, paste a smart trader's wallet, and pick how much play money to spend every time they buy.\n` +
-      `4️⃣ *Get Your Weekly Report:* Tap *Weekly Alpha Report* to see which wallet made the most profit, which chain worked best, and the exact pattern behind winning trades!\n` +
-      `5️⃣ *Flex PnL Cards:* Tap *PnL Image Card* on any trade to get a shareable picture card.\n\n` +
+      `3️⃣ *Investigate Any Wallet:* Paste any wallet address right into chat to see connected wallets, balances, coins launched & Twitter links!\n` +
+      `4️⃣ *Copy Any Wallet Live:* Tap *Watch Wallets*, give it a nickname, and pick your copy size (or \`0\` for Alerts & Reports only).\n` +
+      `5️⃣ *Wallet-by-Wallet Weekly Report:* Tap *Weekly Alpha Report* and pick one wallet at a time!\n` +
+      `6️⃣ *Flex Cards:* Tap *PnL Image Card* or *Detective Card* for shareable pictures.\n\n` +
       `*Quick Commands:* \`/menu\`, \`/funds\`, \`/positions\`, \`/watch\`, \`/report\`, \`/pnl\`, \`/settings\``;
     const kb = new InlineKeyboard().text("🏠 Main Menu", "nav:home");
     if (edit) await safeEditOrReply(ctx, text, kb);
@@ -571,7 +745,7 @@ export function createTelegramBot(services: BotServices): Bot {
         sessions.set(telegramId, { kind: "await_buy_token_ca" });
         return await safeReply(
           ctx,
-          "⚡ Paste any *token address* from Solana, Base, or Robinhood Chain right now:"
+          "⚡ Paste any *token or wallet address* from Solana, Ethereum, Base, or Robinhood Chain right now:"
         );
       }
 
@@ -622,11 +796,7 @@ export function createTelegramBot(services: BotServices): Bot {
       }
 
       if (data === "nav:report") {
-        return await safeEditOrReply(
-          ctx,
-          "📊 *Weekly Alpha & Pattern Recognition*\n\nPick a time window to generate your private report (top wallets, chains, win patterns & copyability scores):",
-          buildReportKeyboard()
-        );
+        return await showReportMenuScreen(vault, ctx, true);
       }
 
       if (data === "nav:settings") {
@@ -646,11 +816,67 @@ export function createTelegramBot(services: BotServices): Bot {
       if (parts[0] === "funds" && parts[1] === "pick" && isChainKey(parts[2])) {
         const chain = parts[2];
         const spec = CHAINS[chain];
-        const bal = (await vault.getBalance(chain)).balanceAtomic;
+        const [balRow, nativePriceUsd] = await Promise.all([
+          vault.getBalance(chain),
+          services.market.getNativePriceUsd(chain).catch(() => 0)
+        ]);
+        const bal = balRow.balanceAtomic;
+        const usdVal = nativeAtomicToUsd(bal, spec.nativeDecimals, nativePriceUsd);
+        const rateStr =
+          nativePriceUsd > 0 ? `\n📊 Live Price: *1 ${spec.nativeSymbol} ≈ ${formatUsd(nativePriceUsd)} USDT*` : "";
         return await safeEditOrReply(
           ctx,
-          `${spec.emoji} *${spec.name} Virtual Balance*\nCurrent: \`${formatExactUnits(bal, spec.nativeDecimals)} ${spec.nativeSymbol}\`\n\nPick a quick amount or type your own exact balance (down to ${spec.nativeDecimals} decimals):`,
-          buildEditChainFundsKeyboard(chain)
+          `${spec.emoji} *${spec.name} Virtual Balance*\nCurrent: \`${formatExactUnits(bal, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
+            nativePriceUsd > 0 ? ` (~*${formatUsd(usdVal)} USDT*)` : ""
+          }${rateStr}\n\nPick a quick **+Add** button, add by exact **USDT dollar value**, or set a new balance:`,
+          buildEditChainFundsKeyboard(chain, nativePriceUsd)
+        );
+      }
+
+      if (parts[0] === "funds" && parts[1] === "add" && isChainKey(parts[2])) {
+        const chain = parts[2];
+        const spec = CHAINS[chain];
+        const amt = parseExactUnits(parts[3], spec.nativeDecimals);
+        const [newBal, nativePriceUsd] = await Promise.all([
+          vault.addVirtualFunds(chain, amt),
+          services.market.getNativePriceUsd(chain).catch(() => 0)
+        ]);
+        const addedUsd = nativeAtomicToUsd(amt, spec.nativeDecimals, nativePriceUsd);
+        const totalUsd = nativeAtomicToUsd(newBal, spec.nativeDecimals, nativePriceUsd);
+        await safeReply(
+          ctx,
+          `✅ Added \`${formatExactUnits(amt, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
+            nativePriceUsd > 0 ? ` (≈ *${formatUsd(addedUsd)} USDT*)` : ""
+          } to *${spec.name}*!\nNew Balance: \`${formatExactUnits(newBal, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
+            nativePriceUsd > 0 ? ` (≈ *${formatUsd(totalUsd)} USDT*)` : ""
+          }`
+        );
+        return await showFundsScreen(vault, ctx, false);
+      }
+
+      if (parts[0] === "funds" && parts[1] === "addnative" && isChainKey(parts[2])) {
+        const chain = parts[2];
+        const spec = CHAINS[chain];
+        const price = await services.market.getNativePriceUsd(chain).catch(() => 0);
+        sessions.set(telegramId, { kind: "await_add_balance_native", chain });
+        return await safeReply(
+          ctx,
+          `➕ How much *${spec.nativeSymbol}* do you want to *ADD* to *${spec.name}*?\n${
+            price > 0 ? `📊 Live rate: *1 ${spec.nativeSymbol} ≈ ${formatUsd(price)} USDT* (I'll show you the USDT value as soon as you type it!)\n` : ""
+          }_Example: \`2.5\` or \`0.0005\`_`
+        );
+      }
+
+      if (parts[0] === "funds" && parts[1] === "addusd" && isChainKey(parts[2])) {
+        const chain = parts[2];
+        const spec = CHAINS[chain];
+        const price = await services.market.getNativePriceUsd(chain).catch(() => 0);
+        sessions.set(telegramId, { kind: "await_add_balance_usd", chain });
+        return await safeReply(
+          ctx,
+          `💵 Type the *USDT dollar amount* you want to *ADD* to your *${spec.name}* balance:\n${
+            price > 0 ? `📊 Live rate right now: *1 ${spec.nativeSymbol} ≈ ${formatUsd(price)} USDT*\n` : ""
+          }_Example: \`500\` or \`25.50\` — I will add the exact *${spec.nativeSymbol}* equivalent!_`
         );
       }
 
@@ -669,10 +895,13 @@ export function createTelegramBot(services: BotServices): Bot {
       if (parts[0] === "funds" && parts[1] === "custom" && isChainKey(parts[2])) {
         const chain = parts[2];
         const spec = CHAINS[chain];
+        const price = await services.market.getNativePriceUsd(chain).catch(() => 0);
         sessions.set(telegramId, { kind: "await_set_balance", chain });
         return await safeReply(
           ctx,
-          `✏️ Type the exact *${spec.nativeSymbol}* virtual balance you want for *${spec.name}*:\n_(Examples: \`12.5\`, \`0.0025\`, or even \`0.${"0".repeat(spec.nativeDecimals - 1)}1\`)_`
+          `✏️ Type the new TOTAL *${spec.nativeSymbol}* balance for *${spec.name}*:\n${
+            price > 0 ? `📊 Live rate: *1 ${spec.nativeSymbol} ≈ ${formatUsd(price)} USDT*\n` : ""
+          }_(Examples: \`12.5\`, \`0.0025\`, or even \`0.${"0".repeat(spec.nativeDecimals - 1)}1\`)_`
         );
       }
 
@@ -827,6 +1056,9 @@ export function createTelegramBot(services: BotServices): Bot {
         const w = await vault.getWatchedWallet(id);
         if (!w) return;
         if (field === "enabled") await vault.updateWatchedWallet(id, { enabled: !w.enabled });
+        if (field === "transferAlerts") {
+          await vault.updateWatchedWallet(id, { transferAlerts: !w.transferAlerts });
+        }
         if (field === "mirrorSells") await vault.updateWatchedWallet(id, { mirrorSells: !w.mirrorSells });
         if (field === "blockRisky") await vault.updateWatchedWallet(id, { blockRisky: !w.blockRisky });
         if (field === "skipIfHeld") await vault.updateWatchedWallet(id, { skipIfHeld: !w.skipIfHeld });
@@ -844,6 +1076,17 @@ export function createTelegramBot(services: BotServices): Bot {
         );
       }
 
+      if (parts[0] === "watch" && parts[1] === "rename") {
+        const walletId = Number(parts[2]);
+        const w = await vault.getWatchedWallet(walletId);
+        if (!w) return;
+        sessions.set(telegramId, { kind: "await_rename_watch", walletId });
+        return await safeReply(
+          ctx,
+          `✏️ Type the new nickname for *${escapeMd(w.alias)}* (\`${shortAddress(w.address)}\`):`
+        );
+      }
+
       if (parts[0] === "watch" && parts[1] === "editamt") {
         const walletId = Number(parts[2]);
         const w = await vault.getWatchedWallet(walletId);
@@ -852,7 +1095,7 @@ export function createTelegramBot(services: BotServices): Bot {
         sessions.set(telegramId, { kind: "await_edit_watch_amount", walletId });
         return await safeReply(
           ctx,
-          `💵 Type the new amount of *${spec.nativeSymbol}* to spend per copied trade (e.g. \`0.25\` or \`0.00005\`), OR a % of your balance like \`10%\`:`
+          `💵 Type the new amount of *${spec.nativeSymbol}* to spend per copied trade (e.g. \`0.25\` or \`0.00005\`), a % like \`10%\`, OR \`0\` for Alert & Investigate Only:`
         );
       }
 
@@ -880,15 +1123,141 @@ export function createTelegramBot(services: BotServices): Bot {
         return await showWatchersScreen(vault, ctx, false);
       }
 
-      // Weekly Report
+      // Weekly Reports (Wallet-by-Wallet + Overall)
+      if (parts[0] === "report" && parts[1] === "wallet") {
+        const walletId = Number(parts[2]);
+        const days = Math.max(1, Math.min(90, Number(parts[3] ?? 7)));
+        const existing = await vault.getWatchedWallet(walletId);
+        if (!existing) return await safeReply(ctx, "❌ Watched wallet not found.");
+
+        await safeReply(
+          ctx,
+          `⏳ Investigating *${escapeMd(existing.alias)}* and building your ${days}-day report...`
+        );
+        const result = await services.weeklyReports.generateForWatchedWallet(vault, walletId, days);
+        if (!result) return await safeReply(ctx, "❌ Could not build wallet report.");
+
+        const cardRefId = registerDetectiveRef(existing.chain, existing.address, {
+          alias: existing.alias,
+          report: result.investigation ?? undefined
+        });
+        const buddyRefs = result.investigation
+          ? await buildBuddyButtonsForReport(vault, result.investigation)
+          : [];
+        const kb = buildWalletReportKeyboard({
+          walletId: existing.id,
+          days,
+          cardRefId,
+          buddyRefs
+        });
+        return await safeReplyChunks(ctx, result.formattedText, kb);
+      }
+
       if (parts[0] === "report" && parts[1] === "run") {
         const days = Math.max(1, Math.min(90, Number(parts[2] ?? 7)));
-        await safeReply(ctx, `⏳ Building your private ${days}-day report...`);
+        await safeReply(ctx, `⏳ Building your private ${days}-day vault summary...`);
         const { formattedText } = await services.weeklyReports.generateForUser(vault, days);
+        const kb = new InlineKeyboard()
+          .text("⬅️ Pick a Wallet Instead", "nav:report")
+          .text("🏠 Main Menu", "nav:home");
+        return await safeReplyChunks(ctx, formattedText, kb);
+      }
+
+      // Wallet Detective Callbacks
+      if (data === "det:ask") {
+        sessions.set(telegramId, { kind: "await_investigate_address" });
         return await safeReply(
           ctx,
-          formattedText,
-          new InlineKeyboard().text("🏠 Main Menu", "nav:home")
+          "🕵️‍♂️ Paste ANY wallet address (Solana or `0x...` EVM) right now to inspect connected wallets, balances, coins launched & Twitter links!"
+        );
+      }
+
+      if (parts[0] === "det" && parts[1] === "go") {
+        const ref = detectiveRefs.get(parts[2]);
+        if (!ref) return await safeReply(ctx, "⚠️ Session expired. Paste the wallet address again!");
+        return await runAndSendWalletDetective(ctx, vault, {
+          chain: ref.chain,
+          address: ref.address,
+          days: 7,
+          alias: ref.alias
+        });
+      }
+
+      if (parts[0] === "det" && parts[1] === "days") {
+        const ref = detectiveRefs.get(parts[2]);
+        const days = Math.max(1, Math.min(90, Number(parts[3] ?? 7)));
+        if (!ref) return await safeReply(ctx, "⚠️ Session expired. Paste the wallet address again!");
+        return await runAndSendWalletDetective(ctx, vault, {
+          chain: ref.chain,
+          address: ref.address,
+          days,
+          alias: ref.alias
+        });
+      }
+
+      if (parts[0] === "det" && parts[1] === "evm" && isChainKey(parts[3])) {
+        const ref = detectiveRefs.get(parts[2]);
+        if (!ref) return await safeReply(ctx, "⚠️ Session expired. Paste the wallet address again!");
+        return await runAndSendWalletDetective(ctx, vault, {
+          chain: parts[3],
+          address: ref.address,
+          days: 7,
+          alias: ref.alias
+        });
+      }
+
+      if (parts[0] === "det" && parts[1] === "card") {
+        const ref = detectiveRefs.get(parts[2]);
+        if (!ref) return await safeReply(ctx, "⚠️ Card session expired. Re-run the investigation!");
+        const report =
+          ref.report ?? (await services.detective.investigateWallet(ref.chain, ref.address, 7));
+        const s = await vault.getSettings();
+        const png = await services.pnlCards.renderDetectivePng(report, s.pnlTheme, ref.alias);
+        return await ctx.replyWithPhoto(new InputFile(png, `detective-${shortAddress(ref.address, 4, 4)}.png`), {
+          caption: `🕵️‍♂️ *Wallet Detective Card* • ${CHAINS[ref.chain].shortBadge} • \`${shortAddress(ref.address)}\``,
+          parse_mode: "Markdown"
+        });
+      }
+
+      if (parts[0] === "det" && parts[1] === "watch") {
+        const ref = detectiveRefs.get(parts[2]);
+        if (!ref) return await safeReply(ctx, "⚠️ Session expired. Paste the address again!");
+        sessions.set(telegramId, {
+          kind: "await_watch_alias",
+          chain: ref.chain,
+          address: normalizeAddress(ref.chain, ref.address)
+        });
+        return await safeReply(
+          ctx,
+          `🏷️ Give this *${CHAINS[ref.chain].name}* wallet (\`${shortAddress(ref.address)}\`) a nickname so you remember it:${
+            ref.alias ? `\n_(Suggestion: \`${escapeMd(ref.alias)}\`)_` : ""
+          }`
+        );
+      }
+
+      // Stateless live funding alert callbacks: dg:<shortChain>:<address> / dw:<shortChain>:<address>
+      if ((parts[0] === "dg" || parts[0] === "dw") && parts.length >= 3) {
+        const targetChain = SHORT_CHAIN_MAP[parts[1]];
+        const addr = parts.slice(2).join(":");
+        if (!targetChain || !isValidAddressFormat(targetChain, addr)) {
+          return await safeReply(ctx, "❌ Invalid wallet alert payload.");
+        }
+        const norm = normalizeAddress(targetChain, addr);
+        if (parts[0] === "dg") {
+          return await runAndSendWalletDetective(ctx, vault, {
+            chain: targetChain,
+            address: norm,
+            days: 7
+          });
+        }
+        sessions.set(telegramId, {
+          kind: "await_watch_alias",
+          chain: targetChain,
+          address: norm
+        });
+        return await safeReply(
+          ctx,
+          `🏷️ Give this *${CHAINS[targetChain].name}* wallet (\`${shortAddress(norm)}\`) a nickname so you remember it:`
         );
       }
 
@@ -1067,7 +1436,7 @@ export function createTelegramBot(services: BotServices): Bot {
       }
       await safeReply(
         ctx,
-        "💡 Paste any token address to trade it, or tap /menu to open all controls!"
+        "💡 Paste any coin OR wallet address right here, or tap /menu to open all controls!"
       );
       return;
     }
@@ -1078,13 +1447,82 @@ export function createTelegramBot(services: BotServices): Bot {
           const spec = CHAINS[pending.chain];
           const atomic = parseExactUnits(text, spec.nativeDecimals);
           await vault.setVirtualFunds(pending.chain, atomic, true);
+          const price = await services.market.getNativePriceUsd(pending.chain).catch(() => 0);
+          const usd = nativeAtomicToUsd(atomic, spec.nativeDecimals, price);
           sessions.clear(telegramId);
           await safeReply(
             ctx,
-            `✅ Updated *${spec.name}* balance to \`${formatExactUnits(atomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`!`
+            `✅ Updated *${spec.name}* balance to \`${formatExactUnits(atomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
+              price > 0 ? ` (≈ *${formatUsd(usd)} USDT*)` : ""
+            }!`
           );
           await showFundsScreen(vault, ctx, false);
           return;
+        }
+
+        case "await_add_balance_native": {
+          const spec = CHAINS[pending.chain];
+          const addAtomic = parseExactUnits(text, spec.nativeDecimals);
+          if (addAtomic <= 0n) throw new Error("Enter an amount greater than 0.");
+          const [nextBal, price] = await Promise.all([
+            vault.addVirtualFunds(pending.chain, addAtomic),
+            services.market.getNativePriceUsd(pending.chain).catch(() => 0)
+          ]);
+          const addedUsd = nativeAtomicToUsd(addAtomic, spec.nativeDecimals, price);
+          const totalUsd = nativeAtomicToUsd(nextBal, spec.nativeDecimals, price);
+          sessions.clear(telegramId);
+          await safeReply(
+            ctx,
+            `✅ Added \`${formatExactUnits(addAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
+              price > 0 ? ` (≈ *${formatUsd(addedUsd)} USDT*)` : ""
+            }!\nNew *${spec.name}* Balance: \`${formatExactUnits(nextBal, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
+              price > 0 ? ` (≈ *${formatUsd(totalUsd)} USDT*)` : ""
+            }`
+          );
+          await showFundsScreen(vault, ctx, false);
+          return;
+        }
+
+        case "await_add_balance_usd": {
+          const spec = CHAINS[pending.chain];
+          const usdVal = Number(text.replace(/[$,\s]/g, ""));
+          if (!Number.isFinite(usdVal) || usdVal <= 0 || usdVal > 1_000_000_000) {
+            throw new Error("Enter a valid dollar amount, like `250` or `19.50`.");
+          }
+          const price = await services.market.getNativePriceUsd(pending.chain);
+          if (price <= 0) {
+            throw new Error(`Couldn't fetch live ${spec.nativeSymbol} price right now — try adding in ${spec.nativeSymbol} instead.`);
+          }
+          const addAtomic = usdToNativeAtomic(usdVal, spec.nativeDecimals, price);
+          if (addAtomic <= 0n) throw new Error("Dollar amount is too small to convert.");
+          const nextBal = await vault.addVirtualFunds(pending.chain, addAtomic);
+          const totalUsd = nativeAtomicToUsd(nextBal, spec.nativeDecimals, price);
+          sessions.clear(telegramId);
+          await safeReply(
+            ctx,
+            `✅ Added \`${formatExactUnits(addAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\` (≈ *${formatUsd(usdVal)} USDT* at *${formatUsd(price)}/${spec.nativeSymbol}*)!\nNew *${spec.name}* Balance: \`${formatExactUnits(nextBal, spec.nativeDecimals)} ${spec.nativeSymbol}\` (≈ *${formatUsd(totalUsd)} USDT*)`
+          );
+          await showFundsScreen(vault, ctx, false);
+          return;
+        }
+
+        case "await_investigate_address": {
+          sessions.clear(telegramId);
+          if (isValidAddressFormat("solana", text)) {
+            return await runAndSendWalletDetective(ctx, vault, {
+              chain: "solana",
+              address: text.trim(),
+              days: 7
+            });
+          }
+          if (/^0x[a-fA-F0-9]{40}$/.test(text.trim())) {
+            return await runAndSendWalletDetective(ctx, vault, {
+              chain: "evm_auto",
+              address: text.trim(),
+              days: 7
+            });
+          }
+          throw new Error("Please paste a valid Solana or `0x...` EVM wallet address.");
         }
 
         case "await_buy_token_ca": {
@@ -1273,7 +1711,8 @@ export function createTelegramBot(services: BotServices): Bot {
             ctx,
             `💵 How much virtual *${spec.nativeSymbol}* should be spent each time *${escapeMd(alias)}* buys?\n\n` +
               `• Type any exact amount (e.g. \`0.25\`, \`0.0005\`, \`0.000000001\`)\n` +
-              `• OR type a % of your balance (e.g. \`10%\`)`
+              `• OR type a % of your balance (e.g. \`10%\`)\n` +
+              `• OR type \`0\` to **Watch & Alert Only** (great for storage vaults!)`
           );
         }
 
@@ -1291,26 +1730,61 @@ export function createTelegramBot(services: BotServices): Bot {
             }
           } else {
             copyAmountAtomic = parseExactUnits(text, spec.nativeDecimals);
-            if (copyAmountAtomic <= 0n) throw new Error("Amount must be greater than 0.");
+            if (copyAmountAtomic < 0n) throw new Error("Amount cannot be negative.");
           }
 
-          const walletId = await vault.addWatchedWallet({
-            chain: pending.chain,
-            address: pending.address,
-            alias: pending.alias,
-            copyMode,
-            copyAmountAtomic,
-            copyPercent
-          });
+          let walletId: number;
+          try {
+            walletId = await vault.addWatchedWallet({
+              chain: pending.chain,
+              address: pending.address,
+              alias: pending.alias,
+              copyMode,
+              copyAmountAtomic,
+              copyPercent
+            });
+          } catch (err) {
+            const msg = (err as Error).message;
+            if (/unique|duplicate/i.test(msg)) {
+              sessions.clear(telegramId);
+              return await safeReply(
+                ctx,
+                `ℹ️ You are already watching \`${shortAddress(pending.address)}\` on *${spec.name}*! Tap *Watch Wallets* in /menu to rename or edit it.`
+              );
+            }
+            throw err;
+          }
           sessions.clear(telegramId);
           await services.walletWatcher.reloadWatchers();
 
           const w = (await vault.getWatchedWallet(walletId))!;
           await safeReply(
             ctx,
-            `🎉 *Now Watching ${escapeMd(w.alias)} Live!*\nThe very second this wallet trades on *${spec.name}*, your demo vault will copy it automatically.`
+            copyAmountAtomic === 0n && copyMode === "fixed"
+              ? `🎉 *Now Watching ${escapeMd(w.alias)} (Alert & Investigate Mode)!*\nYou'll get instant funding alerts + weekly detective reports for *${spec.name}*.`
+              : `🎉 *Now Watching ${escapeMd(w.alias)} Live!*\nThe very second this wallet trades on *${spec.name}*, your demo vault will copy it automatically.`
           );
           return await safeReply(ctx, formatWatchedWalletMessage(w), buildWatcherDetailKeyboard(w));
+        }
+
+        case "await_rename_watch": {
+          const w = await vault.getWatchedWallet(pending.walletId);
+          if (!w) {
+            sessions.clear(telegramId);
+            return await safeReply(ctx, "❌ Wallet not found.");
+          }
+          const newAlias = text.slice(0, 32).trim();
+          if (!newAlias) throw new Error("Please enter a valid name.");
+          await vault.updateWatchedWallet(w.id, { alias: newAlias });
+          sessions.clear(telegramId);
+          await services.walletWatcher.reloadWatchers();
+          const updated = (await vault.getWatchedWallet(w.id))!;
+          await safeReply(ctx, `✅ Renamed wallet to *${escapeMd(updated.alias)}*!`);
+          return await safeReply(
+            ctx,
+            formatWatchedWalletMessage(updated),
+            buildWatcherDetailKeyboard(updated)
+          );
         }
 
         case "await_edit_watch_amount": {
@@ -1332,7 +1806,7 @@ export function createTelegramBot(services: BotServices): Bot {
             });
           } else {
             const amt = parseExactUnits(text, spec.nativeDecimals);
-            if (amt <= 0n) throw new Error("Amount must be greater than 0.");
+            if (amt < 0n) throw new Error("Amount cannot be negative.");
             await vault.updateWatchedWallet(w.id, {
               copyMode: "fixed",
               copyAmountAtomic: amt,

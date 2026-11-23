@@ -1,4 +1,5 @@
-import { InputFile } from "grammy";
+import { InlineKeyboard, InputFile } from "grammy";
+import { CHAINS, shortAddress } from "./chains/registry.js";
 import { loadConfig } from "./config.js";
 import { AdminDb } from "./db/adminDb.js";
 import { UserVaultManager } from "./db/userVault.js";
@@ -8,7 +9,7 @@ import {
   PostgresVaultManager
 } from "./db/postgresStore.js";
 import { IAdminDb, IVaultManager } from "./db/types.js";
-import { createTelegramBot } from "./bot/telegramBot.js";
+import { createTelegramBot, shortChainCode } from "./bot/telegramBot.js";
 import { CopyEngine } from "./services/copyEngine.js";
 import { EvmClientManager } from "./services/evmClients.js";
 import { MarketDataService } from "./services/marketData.js";
@@ -17,6 +18,7 @@ import { PnlCardRenderer } from "./services/pnlCard.js";
 import { SecurityService } from "./services/security.js";
 import { SolanaClientManager } from "./services/solanaClient.js";
 import { ExecutionResult, TradingEngine } from "./services/tradingEngine.js";
+import { WalletDetectiveService } from "./services/walletDetective.js";
 import { WalletWatcherService } from "./services/walletWatcher.js";
 import { WeeklyReportService } from "./services/weeklyReport.js";
 import { formatUsd } from "./utils/amounts.js";
@@ -54,21 +56,39 @@ async function main(): Promise<void> {
   const security = new SecurityService();
   const trading = new TradingEngine(market, security);
   const pnlCards = new PnlCardRenderer();
-  const weeklyReports = new WeeklyReportService({ config, adminDb, vaultManager, market });
+  const detective = new WalletDetectiveService({ config, evmClients, solanaClient, market });
+  const weeklyReports = new WeeklyReportService({ config, adminDb, vaultManager, market, detective });
 
   let botInstance: ReturnType<typeof createTelegramBot> | null = null;
 
   const notifyUser = async (telegramId: string, text: string, result?: ExecutionResult) => {
     if (!botInstance) return;
-    try {
-      await botInstance.api.sendMessage(telegramId, text, {
-        parse_mode: "Markdown",
-        link_preview_options: { is_disabled: true }
-      });
-    } catch {
-      await botInstance.api
-        .sendMessage(telegramId, text.replace(/[*_`]/g, ""))
-        .catch(() => {});
+    const chunks: string[] = [];
+    if (text.length <= 3800) {
+      chunks.push(text);
+    } else {
+      let cur = "";
+      for (const line of text.split("\n")) {
+        if (cur.length + line.length + 1 > 3800 && cur.length > 0) {
+          chunks.push(cur);
+          cur = line;
+        } else {
+          cur = cur ? `${cur}\n${line}` : line;
+        }
+      }
+      if (cur) chunks.push(cur);
+    }
+    for (const chunk of chunks) {
+      try {
+        await botInstance.api.sendMessage(telegramId, chunk, {
+          parse_mode: "Markdown",
+          link_preview_options: { is_disabled: true }
+        });
+      } catch {
+        await botInstance.api
+          .sendMessage(telegramId, chunk.replace(/[*_`]/g, ""))
+          .catch(() => {});
+      }
     }
 
     // Automatically deliver a PNG PnL Card whenever a position closes on sell/TP/SL/copy-sell
@@ -121,7 +141,29 @@ async function main(): Promise<void> {
     vaultManager,
     evmClients,
     solanaClient,
-    copyEngine
+    copyEngine,
+    onTransferAlert: async (telegramId, wallet, transfer) => {
+      if (!botInstance) return;
+      const spec = CHAINS[transfer.chain];
+      const sc = shortChainCode(transfer.chain);
+      const arrow = transfer.direction === "out" ? "➡️ Sent" : "⬅️ Received";
+      const msg =
+        `🚨 *Wallet Movement Alert — ${wallet.alias.replace(/([_*`\[])/g, "\\$1")}* (${spec.shortBadge})\n\n` +
+        `${arrow} *${transfer.amountNative.toFixed(4)} ${transfer.symbol}* ${
+          transfer.direction === "out" ? "to" : "from"
+        }:\n\`${transfer.counterparty}\`\n\n` +
+        `_Tap below to investigate or start watching this connected wallet immediately!_`;
+      const kb = new InlineKeyboard()
+        .text(`🔍 Investigate ${shortAddress(transfer.counterparty, 4, 4)}`, `dg:${sc}:${transfer.counterparty}`)
+        .text(`👁️ Watch ${shortAddress(transfer.counterparty, 4, 4)}`, `dw:${sc}:${transfer.counterparty}`);
+      await botInstance.api
+        .sendMessage(telegramId, msg, {
+          parse_mode: "Markdown",
+          reply_markup: kb,
+          link_preview_options: { is_disabled: true }
+        })
+        .catch(() => {});
+    }
   });
 
   const orderMonitor = new OrderMonitorService({
@@ -141,6 +183,7 @@ async function main(): Promise<void> {
     security,
     trading,
     pnlCards,
+    detective,
     weeklyReports,
     walletWatcher
   });

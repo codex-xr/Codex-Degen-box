@@ -164,6 +164,7 @@ export class UserVault implements IUserVault {
         skip_if_held INTEGER NOT NULL DEFAULT 1,
         mirror_sells INTEGER NOT NULL DEFAULT 1,
         block_risky INTEGER NOT NULL DEFAULT 1,
+        transfer_alerts INTEGER NOT NULL DEFAULT 1,
         sim_mode TEXT NOT NULL DEFAULT 'realistic',
         auto_tp_pct REAL,
         auto_sl_pct REAL,
@@ -202,6 +203,11 @@ export class UserVault implements IUserVault {
         created_at INTEGER NOT NULL
       );
     `);
+
+    const cols = this.db.prepare(`PRAGMA table_info(watched_wallets)`).all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "transfer_alerts")) {
+      this.db.exec(`ALTER TABLE watched_wallets ADD COLUMN transfer_alerts INTEGER NOT NULL DEFAULT 1;`);
+    }
   }
 
   private seedDefaults(): void {
@@ -268,12 +274,12 @@ export class UserVault implements IUserVault {
   async getBalance(chain: ChainKey): Promise<VirtualBalanceRow> {
     const row = this.db
       .prepare(`SELECT * FROM virtual_balances WHERE chain = ?`)
-      .get(chain) as Record<string, unknown>;
+      .get(chain) as Record<string, unknown> | undefined;
     return {
       chain,
-      balanceAtomic: BigInt(String(row.balance_atomic)),
-      initialBalanceAtomic: BigInt(String(row.initial_balance_atomic)),
-      updatedAt: Number(row.updated_at)
+      balanceAtomic: BigInt(String(row?.balance_atomic ?? "0")),
+      initialBalanceAtomic: BigInt(String(row?.initial_balance_atomic ?? "0")),
+      updatedAt: Number(row?.updated_at ?? Date.now())
     };
   }
 
@@ -283,16 +289,44 @@ export class UserVault implements IUserVault {
     if (resetInitial) {
       this.db
         .prepare(
-          `UPDATE virtual_balances
-           SET balance_atomic = ?, initial_balance_atomic = ?, updated_at = ?
-           WHERE chain = ?`
+          `INSERT INTO virtual_balances (chain, balance_atomic, initial_balance_atomic, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chain) DO UPDATE SET
+             balance_atomic = excluded.balance_atomic,
+             initial_balance_atomic = excluded.initial_balance_atomic,
+             updated_at = excluded.updated_at`
         )
-        .run(newBalanceAtomic.toString(), newBalanceAtomic.toString(), now, chain);
+        .run(chain, newBalanceAtomic.toString(), newBalanceAtomic.toString(), now);
     } else {
       this.db
-        .prepare(`UPDATE virtual_balances SET balance_atomic = ?, updated_at = ? WHERE chain = ?`)
-        .run(newBalanceAtomic.toString(), now, chain);
+        .prepare(
+          `INSERT INTO virtual_balances (chain, balance_atomic, initial_balance_atomic, updated_at)
+           VALUES (?, ?, '0', ?)
+           ON CONFLICT(chain) DO UPDATE SET
+             balance_atomic = excluded.balance_atomic,
+             updated_at = excluded.updated_at`
+        )
+        .run(chain, newBalanceAtomic.toString(), now);
     }
+  }
+
+  async addVirtualFunds(chain: ChainKey, addAtomic: bigint): Promise<bigint> {
+    if (addAtomic <= 0n) throw new Error("Amount to add must be greater than zero.");
+    const cur = await this.getBalance(chain);
+    const nextBal = cur.balanceAtomic + addAtomic;
+    const nextInitial = cur.initialBalanceAtomic + addAtomic;
+    const now = Date.now();
+    this.db
+      .prepare(
+        `INSERT INTO virtual_balances (chain, balance_atomic, initial_balance_atomic, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(chain) DO UPDATE SET
+           balance_atomic = excluded.balance_atomic,
+           initial_balance_atomic = excluded.initial_balance_atomic,
+           updated_at = excluded.updated_at`
+      )
+      .run(chain, nextBal.toString(), nextInitial.toString(), now);
+    return nextBal;
   }
 
   async adjustBalance(chain: ChainKey, deltaAtomic: bigint): Promise<bigint> {
@@ -662,9 +696,9 @@ export class UserVault implements IUserVault {
       .prepare(
         `INSERT INTO watched_wallets (
           chain, address, alias, enabled, copy_mode, copy_amount_atomic, copy_percent, max_buy_atomic,
-          min_mc_usd, max_mc_usd, min_liq_usd, skip_if_held, mirror_sells, block_risky,
+          min_mc_usd, max_mc_usd, min_liq_usd, skip_if_held, mirror_sells, block_risky, transfer_alerts,
           sim_mode, auto_tp_pct, auto_sl_pct, created_at
-        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         input.chain,
@@ -680,6 +714,7 @@ export class UserVault implements IUserVault {
         (input.skipIfHeld ?? true) ? 1 : 0,
         (input.mirrorSells ?? true) ? 1 : 0,
         (input.blockRisky ?? true) ? 1 : 0,
+        (input.transferAlerts ?? true) ? 1 : 0,
         input.simMode ?? "realistic",
         input.autoTpPct ?? null,
         input.autoSlPct ?? null,
@@ -717,7 +752,7 @@ export class UserVault implements IUserVault {
         `UPDATE watched_wallets SET
           alias = ?, enabled = ?, copy_mode = ?, copy_amount_atomic = ?, copy_percent = ?,
           max_buy_atomic = ?, min_mc_usd = ?, max_mc_usd = ?, min_liq_usd = ?,
-          skip_if_held = ?, mirror_sells = ?, block_risky = ?, sim_mode = ?,
+          skip_if_held = ?, mirror_sells = ?, block_risky = ?, transfer_alerts = ?, sim_mode = ?,
           auto_tp_pct = ?, auto_sl_pct = ?, last_seen_tx = ?
          WHERE id = ?`
       )
@@ -734,6 +769,7 @@ export class UserVault implements IUserVault {
         (patch.skipIfHeld ?? current.skipIfHeld) ? 1 : 0,
         (patch.mirrorSells ?? current.mirrorSells) ? 1 : 0,
         (patch.blockRisky ?? current.blockRisky) ? 1 : 0,
+        (patch.transferAlerts ?? current.transferAlerts) ? 1 : 0,
         patch.simMode ?? current.simMode,
         patch.autoTpPct !== undefined ? patch.autoTpPct : current.autoTpPct,
         patch.autoSlPct !== undefined ? patch.autoSlPct : current.autoSlPct,
@@ -920,6 +956,7 @@ export class UserVault implements IUserVault {
       skipIfHeld: Number(row.skip_if_held) === 1,
       mirrorSells: Number(row.mirror_sells) === 1,
       blockRisky: Number(row.block_risky) === 1,
+      transferAlerts: row.transfer_alerts === undefined ? true : Number(row.transfer_alerts) === 1,
       simMode: String(row.sim_mode) as SimMode,
       autoTpPct: row.auto_tp_pct !== null ? Number(row.auto_tp_pct) : null,
       autoSlPct: row.auto_sl_pct !== null ? Number(row.auto_sl_pct) : null,

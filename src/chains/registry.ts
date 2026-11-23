@@ -1,4 +1,7 @@
-export type ChainKey = "solana" | "base" | "robinhood";
+export type ChainKey = "solana" | "ethereum" | "base" | "robinhood";
+export type EvmChainKey = "ethereum" | "base" | "robinhood";
+
+export const EVM_CHAIN_KEYS: EvmChainKey[] = ["ethereum", "base", "robinhood"];
 
 export interface ChainSpec {
   key: ChainKey;
@@ -47,6 +50,30 @@ export const CHAINS: Record<ChainKey, ChainSpec> = {
     defaultGasFeeNative: "0.001",
     accentHex: "#9945FF"
   },
+  ethereum: {
+    key: "ethereum",
+    name: "Ethereum",
+    shortBadge: "ETH",
+    emoji: "⚪",
+    vm: "evm",
+    evmChainId: 1,
+    dexScreenerChainId: "ethereum",
+    goPlusChainId: "1",
+    nativeSymbol: "ETH",
+    nativeDecimals: 18,
+    wrappedNativeAddress: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    knownStableAddresses: [
+      "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+    ],
+    explorerBaseUrl: "https://eth.blockscout.com",
+    txPathPrefix: "/tx/",
+    tokenPathPrefix: "/token/",
+    addressPathPrefix: "/address/",
+    defaultBuyPresets: ["0.01", "0.05", "0.1", "0.5"],
+    defaultGasFeeNative: "0.0005",
+    accentHex: "#627EEA"
+  },
   base: {
     key: "base",
     name: "Base",
@@ -94,10 +121,14 @@ export const CHAINS: Record<ChainKey, ChainSpec> = {
   }
 };
 
-export const CHAIN_LIST: ChainSpec[] = [CHAINS.solana, CHAINS.base, CHAINS.robinhood];
+export const CHAIN_LIST: ChainSpec[] = [CHAINS.solana, CHAINS.ethereum, CHAINS.base, CHAINS.robinhood];
 
 export function isChainKey(value: string): value is ChainKey {
-  return value === "solana" || value === "base" || value === "robinhood";
+  return value === "solana" || value === "ethereum" || value === "base" || value === "robinhood";
+}
+
+export function isEvmChainKey(value: string): value is EvmChainKey {
+  return value === "ethereum" || value === "base" || value === "robinhood";
 }
 
 export function getChain(key: ChainKey): ChainSpec {
@@ -123,8 +154,13 @@ export function isValidAddressFormat(chain: ChainKey, address: string): boolean 
 export function detectChainFromAddress(address: string): ChainKey | null {
   const trimmed = address.trim();
   if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmed)) return "solana";
-  if (/^0x[a-fA-F0-9]{40}$/.test(trimmed)) return null; // Could be Base or Robinhood
+  if (/^0x[a-fA-F0-9]{40}$/.test(trimmed)) return null; // Could be Ethereum, Base, or Robinhood
   return null;
+}
+
+export function explorerAddressUrl(chain: ChainKey, address: string): string {
+  const c = CHAINS[chain];
+  return `${c.explorerBaseUrl}${c.addressPathPrefix}${address}`;
 }
 
 export function shortAddress(address: string, left = 6, right = 4): string {

@@ -1,4 +1,4 @@
-import { ChainKey, CHAINS } from "../chains/registry.js";
+import { ChainKey, CHAINS, explorerAddressUrl, shortAddress } from "../chains/registry.js";
 import { AppConfig } from "../config.js";
 import {
   IAdminDb,
@@ -10,6 +10,7 @@ import {
 } from "../db/types.js";
 import { formatDuration, formatUsd } from "../utils/amounts.js";
 import { MarketDataService } from "./marketData.js";
+import { WalletDetectiveService, WalletInvestigationReport } from "./walletDetective.js";
 
 export interface WalletAttributionStats {
   walletId: number;
@@ -81,6 +82,7 @@ export class WeeklyReportService {
   private readonly adminDb: IAdminDb;
   private readonly vaultManager: IVaultManager;
   private readonly market: MarketDataService;
+  private readonly detective?: WalletDetectiveService;
   private timer: NodeJS.Timeout | null = null;
   private onAutoReport?: (telegramId: string, reportText: string) => Promise<void>;
 
@@ -89,11 +91,13 @@ export class WeeklyReportService {
     adminDb: IAdminDb;
     vaultManager: IVaultManager;
     market: MarketDataService;
+    detective?: WalletDetectiveService;
   }) {
     this.config = params.config;
     this.adminDb = params.adminDb;
     this.vaultManager = params.vaultManager;
     this.market = params.market;
+    this.detective = params.detective;
   }
 
   startScheduler(onAutoReport: (telegramId: string, reportText: string) => Promise<void>): void {
@@ -131,8 +135,24 @@ export class WeeklyReportService {
       if (latest && latest.createdAt >= weekAgo) continue;
 
       try {
-        const { formattedText } = await this.generateForUser(vault, 7);
-        await this.onAutoReport(userId, formattedText);
+        const wallets = await vault.listWatchedWallets(true);
+        if (wallets.length > 0 && this.detective) {
+          for (const w of wallets.slice(0, 6)) {
+            const perWallet = await this.generateForWatchedWallet(vault, w.id, 7);
+            if (perWallet) {
+              await this.onAutoReport(userId, perWallet.formattedText);
+            }
+          }
+          await vault.saveWeeklyReport({
+            periodStart: Date.now() - 7 * 86_400_000,
+            periodEnd: Date.now(),
+            summaryJson: JSON.stringify({ mode: "wallet_by_wallet", wallets: wallets.length }),
+            reportText: `Sent ${Math.min(6, wallets.length)} wallet-by-wallet reports.`
+          });
+        } else {
+          const { formattedText } = await this.generateForUser(vault, 7);
+          await this.onAutoReport(userId, formattedText);
+        }
       } catch {
         // ignore transient errors on scheduled send
       }
@@ -188,6 +208,53 @@ export class WeeklyReportService {
     });
 
     return { summary, formattedText };
+  }
+
+  /**
+   * Generates a complete wallet-by-wallet report combining copy-trade attribution
+   * + on-chain Detective Investigation (most interacted buddies, balances, coins launched, Twitter).
+   */
+  async generateForWatchedWallet(
+    vault: IUserVault,
+    walletId: number,
+    days = 7
+  ): Promise<{
+    wallet: WatchedWalletRow;
+    stats: WalletAttributionStats | null;
+    investigation: WalletInvestigationReport | null;
+    formattedText: string;
+  } | null> {
+    const wallet = await vault.getWatchedWallet(walletId);
+    if (!wallet) return null;
+
+    const periodEnd = Date.now();
+    const periodStart = periodEnd - days * 86_400_000;
+    const [positions, observedSwaps, investigation] = await Promise.all([
+      vault.listPositionsInPeriod(periodStart, periodEnd),
+      vault.listObservedSwapsBetween(periodStart, periodEnd),
+      this.detective
+        ? this.detective.investigateWallet(wallet.chain, wallet.address, days)
+        : Promise.resolve(null)
+    ]);
+
+    const summary = this.computeSummary({
+      periodStart,
+      periodEnd,
+      tradesCount: 0,
+      positions,
+      wallets: [wallet],
+      observedSwaps
+    });
+    const stats = summary.walletLeaderboard.find((w) => w.walletId === wallet.id) ?? null;
+
+    const formattedText = formatWalletReportCombined({
+      wallet,
+      stats,
+      investigation,
+      days
+    });
+
+    return { wallet, stats, investigation, formattedText };
   }
 
   computeSummary(input: {
@@ -676,3 +743,239 @@ export class WeeklyReportService {
     return null;
   }
 }
+
+function escMd(text: string): string {
+  return text.replace(/([_*`\[])/g, "\\$1");
+}
+
+function formatAgo(ms: number | null): string {
+  if (!ms) return "Unknown";
+  const diff = Math.max(0, Date.now() - ms);
+  return `${formatDuration(diff)} ago`;
+}
+
+export function formatWalletReportCombined(params: {
+  wallet: WatchedWalletRow;
+  stats: WalletAttributionStats | null;
+  investigation: WalletInvestigationReport | null;
+  days: number;
+}): string {
+  const { wallet, stats, investigation, days } = params;
+  const spec = CHAINS[wallet.chain];
+  const lines: string[] = [];
+
+  lines.push(`${spec.emoji} *WALLET REPORT: ${escMd(wallet.alias)}* (${spec.shortBadge} • ${days}d)`);
+  lines.push(`\`${wallet.address}\``);
+  lines.push("");
+
+  // 1. Copy-trading performance for THIS wallet
+  lines.push("📈 *Copy-Trading Performance:*");
+  if (stats && stats.positionsCount > 0) {
+    const sign = stats.netPnlUsd >= 0 ? "+" : "";
+    lines.push(
+      `• Result: *${sign}${formatUsd(stats.netPnlUsd)}* (${stats.roiPct >= 0 ? "+" : ""}${stats.roiPct.toFixed(1)}%)`
+    );
+    lines.push(
+      `• Trades: *${stats.positionsCount}* (${stats.wins}W / ${stats.losses}L${
+        stats.rugs > 0 ? ` / ${stats.rugs} Rugged` : ""
+      }) | Copy Score: *${stats.copyabilityScore}/100*`
+    );
+    for (const note of stats.patternNotes.slice(0, 3)) {
+      lines.push(`• _${escMd(note)}_`);
+    }
+  } else {
+    lines.push("• Quiet on copied swaps (0 copied trades in this window — could be a storage vault!).");
+  }
+
+  if (investigation) {
+    lines.push("");
+    lines.push(...buildInvestigationLines(investigation, { includeHeader: false }));
+  }
+
+  return lines.join("\n");
+}
+
+export function formatDetectiveReportMessage(
+  report: WalletInvestigationReport,
+  alias?: string
+): string {
+  return buildInvestigationLines(report, { includeHeader: true, alias }).join("\n");
+}
+
+function buildInvestigationLines(
+  r: WalletInvestigationReport,
+  opts: { includeHeader: boolean; alias?: string }
+): string[] {
+  const spec = CHAINS[r.chain];
+  const lines: string[] = [];
+
+  if (opts.includeHeader) {
+    const title = opts.alias ? `${escMd(opts.alias)} (${shortAddress(r.address)})` : shortAddress(r.address, 8, 6);
+    lines.push(`🕵️‍♂️ *WALLET DETECTIVE: ${title}* (${spec.name} • ${r.days}d)`);
+    lines.push(`\`${r.address}\``);
+    lines.push("");
+  }
+
+  lines.push(`🏷️ *Wallet Type:* ${r.roleSummary}`);
+  lines.push(
+    `💰 *Existing Balance:* \`${r.nativeBalanceStr} ${r.nativeSymbol}\` (~*${formatUsd(
+      r.nativeUsd
+    )}*)${r.totalHoldingsUsd > r.nativeUsd + 1 ? ` | Total w/ Coins: ~*${formatUsd(r.totalHoldingsUsd)}*` : ""}`
+  );
+  if (r.topHoldings.length > 0) {
+    const tops = r.topHoldings
+      .slice(0, 4)
+      .map((h) => `*$${escMd(h.symbol)}* (${h.amountStr}${h.usdValue > 0.5 ? `, ~${formatUsd(h.usdValue)}` : ""})`)
+      .join(" • ");
+    lines.push(`🪙 *Coins Held Now:* ${tops}`);
+  }
+
+  const lastStr = r.lastActiveAtMs ? formatAgo(r.lastActiveAtMs) : "Quiet";
+  lines.push(
+    `⚡ *${r.days}d Activity:* *${r.activityCount}* moves (*${r.swapsCount}* swaps, *${r.transfersCount}* transfers) | Last active: *${lastStr}*`
+  );
+  if (r.tradingStyle || r.peakHoursUtc) {
+    lines.push(
+      `🧠 *Style:* ${r.tradingStyle ?? "Unknown"}${r.peakHoursUtc ? ` | 🕒 Peak Hours: *${r.peakHoursUtc}*` : ""}`
+    );
+  }
+
+  // Twitter / Social Identity & Cross-Chain Twin
+  lines.push("");
+  lines.push("🐦 *Twitter / X & Public Clues:*");
+  if (r.identity.twitterHandles.length > 0) {
+    lines.push(
+      `• *Linked Twitter/X:* ${r.identity.twitterHandles.map((t) => `@${escMd(t)} (https://x.com/${t})`).join(", ")}`
+    );
+  } else if (r.identity.coinSocialTwitters.length > 0) {
+    lines.push(
+      `• *Coin Social Twitter:* ${r.identity.coinSocialTwitters.map((t) => `@${escMd(t)}`).join(", ")} _(attached to a coin it launched)_`
+    );
+  } else {
+    lines.push("• *Twitter/X:* No public Twitter linked to this wallet.");
+  }
+
+  if (r.identity.domains.length > 0) {
+    lines.push(`• *Wallet Names:* ${r.identity.domains.map(escMd).join(", ")}`);
+  }
+  if (r.identity.pumpUsername) {
+    lines.push(
+      `• *Pump.fun Profile:* \`${escMd(r.identity.pumpUsername)}\`${
+        r.identity.pumpFollowers !== null ? ` (${r.identity.pumpFollowers} followers)` : ""
+      }`
+    );
+  }
+  if (r.identity.farcasterHandles.length > 0) {
+    lines.push(`• *Farcaster:* ${r.identity.farcasterHandles.map(escMd).join(", ")}`);
+  }
+  if (r.identity.linkedEvmWallet) {
+    lines.push(`• *Cross-Chain Twin EVM Wallet:* \`${r.identity.linkedEvmWallet}\``);
+  }
+  if (r.identity.linkedSolWallet) {
+    lines.push(`• *Cross-Chain Twin Solana Wallet:* \`${r.identity.linkedSolWallet}\``);
+  }
+
+  // Launched Coins
+  lines.push("");
+  lines.push(`🚀 *Launched Coins Before?* ${r.launchedCount > 0 ? `*YES (${r.launchedCount} found!)*` : "*No launches found*"}`);
+  for (const c of r.launchedCoins.slice(0, 4)) {
+    const grad = c.graduated ? "🎓 Graduated" : "Curved/Early";
+    const mc = c.mcUsd > 0 ? ` • MC ${formatUsd(c.mcUsd)}` : "";
+    const tw = c.twitter ? ` • X: @${escMd(c.twitter)}` : "";
+    lines.push(`• *$${escMd(c.symbol)}* (${escMd(c.name)}) — ${grad}${mc}${tw}`);
+  }
+
+  if (r.firstFunder) {
+    lines.push("");
+    lines.push(
+      `🔑 *First Funder Clue:* Started by *${escMd(
+        r.firstFunder.label ?? shortAddress(r.firstFunder.address)
+      )}* (\`${r.firstFunder.address}\`)${
+        r.firstFunder.amountNative > 0 ? ` with ${r.firstFunder.amountNative.toFixed(3)} ${r.nativeSymbol}` : ""
+      }`
+    );
+  }
+
+  // Most Interacted Wallets ("The Circle")
+  lines.push("");
+  lines.push(`🤝 *Most Connected Wallets (${r.days}d Familiar Circle):*`);
+  if (r.connectedWallets.length === 0) {
+    lines.push("• No direct wallet-to-wallet transfers spotted inside this window.");
+  } else {
+    for (const [idx, b] of r.connectedWallets.slice(0, 5).entries()) {
+      const tagName = b.label ? `*${escMd(b.label)}* ` : "";
+      const movedParts: string[] = [];
+      if (b.inflowNative > 0.001) movedParts.push(`+${b.inflowNative.toFixed(2)} ${r.nativeSymbol} IN`);
+      if (b.outflowNative > 0.001) movedParts.push(`-${b.outflowNative.toFixed(2)} ${r.nativeSymbol} OUT`);
+      const movedStr = movedParts.length > 0 ? ` (${movedParts.join(", ")})` : "";
+
+      lines.push(
+        `${idx + 1}. ${b.roleBadge} ${tagName}([${shortAddress(b.address)}](${explorerAddressUrl(
+          r.chain,
+          b.address
+        )}))`
+      );
+      lines.push(`   \`${b.address}\``);
+      lines.push(`   • *${b.interactionsCount}x* together • ${b.directionTag}${movedStr}`);
+
+      if (!b.isExchangeOrApp && b.nativeBalance !== null) {
+        const bUsd = b.totalHoldingsUsd ?? b.nativeUsd ?? 0;
+        const holdNote = b.topHolding ? ` | Top coin: ${escMd(b.topHolding)}` : "";
+        lines.push(
+          `   • *Balance:* \`${b.nativeBalance.toFixed(3)} ${r.nativeSymbol}\` (~${formatUsd(bUsd)})${holdNote}`
+        );
+        lines.push(
+          `   • *${r.days}d Activity:* *${b.activityCount ?? 0}* moves (*${
+            b.swapsCount ?? 0
+          }* swaps) | Last seen: *${formatAgo(b.lastActiveAtMs)}*`
+        );
+        if (b.launchedCount > 0) {
+          const sample = b.launchedCoins[0] ? ` (e.g. $${escMd(b.launchedCoins[0].symbol)})` : "";
+          lines.push(`   • *Coins Launched:* *YES (${b.launchedCount})*${sample}`);
+        } else {
+          lines.push("   • *Coins Launched:* None found");
+        }
+        if (b.identity.twitterHandles.length > 0) {
+          lines.push(
+            `   • *Twitter/X:* ${b.identity.twitterHandles.map((t) => `@${escMd(t)}`).join(", ")}`
+          );
+        } else if (b.identity.domains.length > 0) {
+          lines.push(`   • *Name:* ${b.identity.domains.map(escMd).join(", ")}`);
+        }
+        if (b.identity.linkedEvmWallet) {
+          lines.push(`   • *Twin EVM:* \`${b.identity.linkedEvmWallet}\``);
+        }
+        if (b.hop2Targets.length > 0) {
+          const h2 = b.hop2Targets
+            .map((h) => `${escMd(h.label ?? shortAddress(h.address))} (${h.count}x ${h.direction})`)
+            .join(", ");
+          lines.push(`   • *2nd-Step Trail:* Also talks to ${h2}`);
+        }
+      }
+    }
+  }
+
+  if (r.crossChainGlances.length > 1) {
+    lines.push("");
+    lines.push("🌐 *Activity Across EVM Chains:*");
+    for (const g of r.crossChainGlances) {
+      lines.push(
+        `• ${g.emoji} *${g.chainLabel}:* \`${g.balanceNative.toFixed(4)} ${g.nativeSymbol}\` (~${formatUsd(
+          g.usdValue
+        )}) • ${g.txCount >= 50 ? "50+" : g.txCount} recent moves`
+      );
+    }
+  }
+
+  if (r.notes.length > 0) {
+    lines.push("");
+    for (const n of r.notes) {
+      lines.push(`ℹ️ _${escMd(n)}_`);
+    }
+  }
+
+  lines.push("");
+  lines.push(`[Open on Explorer](${explorerAddressUrl(r.chain, r.address)})`);
+  return lines;
+}
+

@@ -190,6 +190,19 @@ export class CopyEngine {
       return;
     }
 
+    const isWatchOnly =
+      (ctx.wallet.copyMode === "fixed" && ctx.wallet.copyAmountAtomic <= 0n) ||
+      (ctx.wallet.copyMode === "percent_balance" && ctx.wallet.copyPercent <= 0);
+    if (isWatchOnly) {
+      if ((await recordSwap("alert_only", "Alert & investigate mode ($0 copy)")) && ctx.notifyEnabled) {
+        await this.onNotify(
+          ctx.telegramId,
+          `👀 *Wallet Trade Alert:* *${ctx.wallet.alias}* bought *$${ctx.symbol}* (${ctx.specBadge}) at ${formatUsd(ctx.snap.mcUsd)} MC.`
+        );
+      }
+      return;
+    }
+
     const available = (await ctx.vault.getBalance(ctx.swap.chain)).balanceAtomic;
     let spendAtomic = 0n;
     if (ctx.wallet.copyMode === "fixed") {

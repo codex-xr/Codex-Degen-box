@@ -543,6 +543,7 @@ export class PostgresUserVault implements IUserVault {
         skip_if_held SMALLINT NOT NULL DEFAULT 1,
         mirror_sells SMALLINT NOT NULL DEFAULT 1,
         block_risky SMALLINT NOT NULL DEFAULT 1,
+        transfer_alerts SMALLINT NOT NULL DEFAULT 1,
         sim_mode TEXT NOT NULL DEFAULT 'realistic',
         auto_tp_pct DOUBLE PRECISION,
         auto_sl_pct DOUBLE PRECISION,
@@ -581,6 +582,7 @@ export class PostgresUserVault implements IUserVault {
         created_at BIGINT NOT NULL
       );
 
+      ALTER TABLE ${s}.watched_wallets ADD COLUMN IF NOT EXISTS transfer_alerts SMALLINT NOT NULL DEFAULT 1;
       ALTER TABLE ${s}.virtual_balances ENABLE ROW LEVEL SECURITY;
       ALTER TABLE ${s}.user_settings ENABLE ROW LEVEL SECURITY;
       ALTER TABLE ${s}.positions ENABLE ROW LEVEL SECURITY;
@@ -673,18 +675,44 @@ export class PostgresUserVault implements IUserVault {
     if (resetInitial) {
       await runQuery(
         this.pool,
-        `UPDATE ${this.t("virtual_balances")}
-         SET balance_atomic = $1, initial_balance_atomic = $2, updated_at = $3
-         WHERE chain = $4`,
-        [newBalanceAtomic.toString(), newBalanceAtomic.toString(), now, chain]
+        `INSERT INTO ${this.t("virtual_balances")} (chain, balance_atomic, initial_balance_atomic, updated_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (chain) DO UPDATE SET
+           balance_atomic = EXCLUDED.balance_atomic,
+           initial_balance_atomic = EXCLUDED.initial_balance_atomic,
+           updated_at = EXCLUDED.updated_at`,
+        [chain, newBalanceAtomic.toString(), newBalanceAtomic.toString(), now]
       );
     } else {
       await runQuery(
         this.pool,
-        `UPDATE ${this.t("virtual_balances")} SET balance_atomic = $1, updated_at = $2 WHERE chain = $3`,
-        [newBalanceAtomic.toString(), now, chain]
+        `INSERT INTO ${this.t("virtual_balances")} (chain, balance_atomic, initial_balance_atomic, updated_at)
+         VALUES ($1, $2, '0', $3)
+         ON CONFLICT (chain) DO UPDATE SET
+           balance_atomic = EXCLUDED.balance_atomic,
+           updated_at = EXCLUDED.updated_at`,
+        [chain, newBalanceAtomic.toString(), now]
       );
     }
+  }
+
+  async addVirtualFunds(chain: ChainKey, addAtomic: bigint): Promise<bigint> {
+    if (addAtomic <= 0n) throw new Error("Amount to add must be greater than zero.");
+    const cur = await this.getBalance(chain);
+    const nextBal = cur.balanceAtomic + addAtomic;
+    const nextInitial = cur.initialBalanceAtomic + addAtomic;
+    const now = Date.now();
+    await runQuery(
+      this.pool,
+      `INSERT INTO ${this.t("virtual_balances")} (chain, balance_atomic, initial_balance_atomic, updated_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (chain) DO UPDATE SET
+         balance_atomic = EXCLUDED.balance_atomic,
+         initial_balance_atomic = EXCLUDED.initial_balance_atomic,
+         updated_at = EXCLUDED.updated_at`,
+      [chain, nextBal.toString(), nextInitial.toString(), now]
+    );
+    return nextBal;
   }
 
   async adjustBalance(chain: ChainKey, deltaAtomic: bigint): Promise<bigint> {
@@ -1071,9 +1099,9 @@ export class PostgresUserVault implements IUserVault {
       this.pool,
       `INSERT INTO ${this.t("watched_wallets")} (
         chain, address, alias, enabled, copy_mode, copy_amount_atomic, copy_percent, max_buy_atomic,
-        min_mc_usd, max_mc_usd, min_liq_usd, skip_if_held, mirror_sells, block_risky,
+        min_mc_usd, max_mc_usd, min_liq_usd, skip_if_held, mirror_sells, block_risky, transfer_alerts,
         sim_mode, auto_tp_pct, auto_sl_pct, created_at
-      ) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+      ) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
       RETURNING id`,
       [
         input.chain,
@@ -1089,6 +1117,7 @@ export class PostgresUserVault implements IUserVault {
         (input.skipIfHeld ?? true) ? 1 : 0,
         (input.mirrorSells ?? true) ? 1 : 0,
         (input.blockRisky ?? true) ? 1 : 0,
+        (input.transferAlerts ?? true) ? 1 : 0,
         input.simMode ?? "realistic",
         input.autoTpPct ?? null,
         input.autoSlPct ?? null,
@@ -1125,9 +1154,9 @@ export class PostgresUserVault implements IUserVault {
       `UPDATE ${this.t("watched_wallets")} SET
         alias = $1, enabled = $2, copy_mode = $3, copy_amount_atomic = $4, copy_percent = $5,
         max_buy_atomic = $6, min_mc_usd = $7, max_mc_usd = $8, min_liq_usd = $9,
-        skip_if_held = $10, mirror_sells = $11, block_risky = $12, sim_mode = $13,
-        auto_tp_pct = $14, auto_sl_pct = $15, last_seen_tx = $16
-       WHERE id = $17`,
+        skip_if_held = $10, mirror_sells = $11, block_risky = $12, transfer_alerts = $13, sim_mode = $14,
+        auto_tp_pct = $15, auto_sl_pct = $16, last_seen_tx = $17
+       WHERE id = $18`,
       [
         patch.alias ?? current.alias,
         (patch.enabled ?? current.enabled) ? 1 : 0,
@@ -1141,6 +1170,7 @@ export class PostgresUserVault implements IUserVault {
         (patch.skipIfHeld ?? current.skipIfHeld) ? 1 : 0,
         (patch.mirrorSells ?? current.mirrorSells) ? 1 : 0,
         (patch.blockRisky ?? current.blockRisky) ? 1 : 0,
+        (patch.transferAlerts ?? current.transferAlerts) ? 1 : 0,
         patch.simMode ?? current.simMode,
         patch.autoTpPct !== undefined ? patch.autoTpPct : current.autoTpPct,
         patch.autoSlPct !== undefined ? patch.autoSlPct : current.autoSlPct,
@@ -1344,6 +1374,7 @@ export class PostgresUserVault implements IUserVault {
       skipIfHeld: Number(row.skip_if_held) === 1,
       mirrorSells: Number(row.mirror_sells) === 1,
       blockRisky: Number(row.block_risky) === 1,
+      transferAlerts: row.transfer_alerts === undefined ? true : Number(row.transfer_alerts) === 1,
       simMode: String(row.sim_mode) as SimMode,
       autoTpPct: row.auto_tp_pct !== null && row.auto_tp_pct !== undefined ? Number(row.auto_tp_pct) : null,
       autoSlPct: row.auto_sl_pct !== null && row.auto_sl_pct !== undefined ? Number(row.auto_sl_pct) : null,

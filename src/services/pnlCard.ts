@@ -3,9 +3,14 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import satori from "satori";
 import { Resvg } from "@resvg/resvg-js";
-import { ChainKey, CHAINS } from "../chains/registry.js";
+import { ChainKey, CHAINS, shortAddress } from "../chains/registry.js";
 import { PnlTheme } from "../db/userVault.js";
 import { formatDuration, formatExactUnits, formatUsd } from "../utils/amounts.js";
+import { WalletInvestigationReport } from "./walletDetective.js";
+
+function asciiClean(input: string): string {
+  return input.replace(/[^\x20-\x7E]/g, "").trim() || "-";
+}
 
 const require = createRequire(import.meta.url);
 
@@ -375,13 +380,274 @@ export class PnlCardRenderer {
       }
     };
 
+    return this.renderElementToPng(element, 1200, 675);
+  }
+
+  async renderDetectivePng(
+    report: WalletInvestigationReport,
+    theme: PnlTheme,
+    alias?: string
+  ): Promise<Buffer> {
+    const palette = PALETTES[theme] ?? PALETTES.cyber;
+    const spec = CHAINS[report.chain];
+    const titleLabel = asciiClean(alias ? `${alias} (${shortAddress(report.address)})` : shortAddress(report.address, 8, 6));
+    const roleLabel = asciiClean(report.roleSummary).toUpperCase();
+    const twitterStr =
+      report.identity.twitterHandles.length > 0
+        ? report.identity.twitterHandles.map((t) => `@${t}`).join(", ")
+        : "None publicly linked";
+    const domainStr =
+      [...report.identity.domains, report.identity.pumpUsername ? `pump:${report.identity.pumpUsername}` : ""]
+        .filter(Boolean)
+        .map(asciiClean)
+        .join(" | ") || shortAddress(report.address, 8, 6);
+
+    const buddies = report.connectedWallets.slice(0, 4);
+
+    const element = {
+      type: "div",
+      props: {
+        style: {
+          width: "1200px",
+          height: "675px",
+          boxSizing: "border-box",
+          display: "flex",
+          flexDirection: "column",
+          justifyContent: "space-between",
+          padding: "34px 44px",
+          backgroundImage: `radial-gradient(circle at 85% 20%, rgba(56, 189, 248, 0.18), transparent 55%), ${palette.bg}`,
+          color: "#F8FAFC",
+          fontFamily: "Inter"
+        },
+        children: [
+          {
+            type: "div",
+            props: {
+              style: { display: "flex", justifyContent: "space-between", alignItems: "center" },
+              children: [
+                {
+                  type: "div",
+                  props: {
+                    style: { display: "flex", alignItems: "center", gap: "12px" },
+                    children: [
+                      {
+                        type: "div",
+                        props: {
+                          style: {
+                            display: "flex",
+                            fontSize: "22px",
+                            fontWeight: 700,
+                            fontFamily: "Space Grotesk",
+                            color: "#FFFFFF"
+                          },
+                          children: "WALLET DETECTIVE DOSSIER"
+                        }
+                      },
+                      {
+                        type: "div",
+                        props: {
+                          style: {
+                            display: "flex",
+                            padding: "5px 12px",
+                            borderRadius: "999px",
+                            background: palette.badgeBg,
+                            border: `1px solid ${palette.accent}`,
+                            color: palette.accent,
+                            fontSize: "13px",
+                            fontWeight: 700
+                          },
+                          children: `${spec.shortBadge} • ${report.days}D SCAN`
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  type: "div",
+                  props: {
+                    style: {
+                      display: "flex",
+                      padding: "6px 14px",
+                      borderRadius: "999px",
+                      background: "rgba(255,255,255,0.08)",
+                      fontSize: "13px",
+                      fontWeight: 700,
+                      color: "#E2E8F0"
+                    },
+                    children: roleLabel
+                  }
+                }
+              ]
+            }
+          },
+          {
+            type: "div",
+            props: {
+              style: { display: "flex", flexDirection: "column", gap: "6px" },
+              children: [
+                {
+                  type: "div",
+                  props: {
+                    style: {
+                      display: "flex",
+                      fontSize: "34px",
+                      fontWeight: 700,
+                      fontFamily: "Space Grotesk",
+                      color: "#FFFFFF"
+                    },
+                    children: titleLabel
+                  }
+                },
+                {
+                  type: "div",
+                  props: {
+                    style: { display: "flex", fontSize: "16px", color: "#94A3B8" },
+                    children: `X/Twitter: ${twitterStr}   |   IDs: ${domainStr}`
+                  }
+                }
+              ]
+            }
+          },
+          {
+            type: "div",
+            props: {
+              style: { display: "flex", gap: "14px" },
+              children: [
+                this.statBox(
+                  "EXISTING BALANCE",
+                  `${report.nativeBalanceStr} ${report.nativeSymbol} (${formatUsd(report.totalHoldingsUsd)})`,
+                  palette
+                ),
+                this.statBox(
+                  `${report.days}D ACTIVITY`,
+                  `${report.activityCount} moves (${report.swapsCount} swaps)`,
+                  palette
+                ),
+                this.statBox(
+                  "COINS LAUNCHED",
+                  report.launchedCount > 0 ? `${report.launchedCount} created` : "0 found",
+                  palette
+                )
+              ]
+            }
+          },
+          {
+            type: "div",
+            props: {
+              style: {
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+                padding: "16px 20px",
+                borderRadius: "14px",
+                background: palette.panel,
+                border: `1px solid ${palette.border}`
+              },
+              children: [
+                {
+                  type: "div",
+                  props: {
+                    style: {
+                      display: "flex",
+                      fontSize: "13px",
+                      fontWeight: 700,
+                      letterSpacing: "1px",
+                      color: palette.accent
+                    },
+                    children: "TOP CONNECTED WALLETS (MOST INTERACTIONS)"
+                  }
+                },
+                ...(buddies.length === 0
+                  ? [
+                      {
+                        type: "div",
+                        props: {
+                          style: { display: "flex", fontSize: "15px", color: "#94A3B8" },
+                          children: "No direct wallet transfers spotted inside this window."
+                        }
+                      }
+                    ]
+                  : buddies.map((b) => {
+                      const bName = asciiClean(b.label ? `${b.label} (${shortAddress(b.address)})` : shortAddress(b.address, 7, 5));
+                      const dir = asciiClean(b.directionTag);
+                      const bal = b.totalHoldingsUsd !== null ? formatUsd(b.totalHoldingsUsd) : "-";
+                      const tw = b.identity.twitterHandles[0] ? `@${b.identity.twitterHandles[0]}` : "";
+                      const coinStr = b.launchedCount > 0 ? ` • ${b.launchedCount} coins` : "";
+                      return {
+                        type: "div",
+                        props: {
+                          style: {
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            fontSize: "15px",
+                            color: "#F1F5F9"
+                          },
+                          children: [
+                            {
+                              type: "div",
+                              props: {
+                                style: { display: "flex", fontWeight: 600 },
+                                children: `${bName}  [${b.interactionsCount}x • ${dir}]`
+                              }
+                            },
+                            {
+                              type: "div",
+                              props: {
+                                style: { display: "flex", color: "#CBD5E1", fontSize: "14px" },
+                                children: `${asciiClean(b.roleBadge)} • Bal ${bal}${coinStr}${tw ? ` • ${tw}` : ""}`
+                              }
+                            }
+                          ]
+                        }
+                      };
+                    }))
+              ]
+            }
+          },
+          {
+            type: "div",
+            props: {
+              style: {
+                display: "flex",
+                justifyContent: "space-between",
+                fontSize: "14px",
+                color: "#94A3B8"
+              },
+              children: [
+                {
+                  type: "div",
+                  props: {
+                    style: { display: "flex" },
+                    children: report.firstFunder
+                      ? `First funder: ${asciiClean(report.firstFunder.label ?? shortAddress(report.firstFunder.address))}`
+                      : `Peak hours: ${report.peakHoursUtc ?? "N/A"}`
+                  }
+                },
+                {
+                  type: "div",
+                  props: {
+                    style: { display: "flex" },
+                    children: "Codex Degen Box • On-Chain Wallet Investigation"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    };
+
+    return this.renderElementToPng(element, 1200, 675);
+  }
+
+  private async renderElementToPng(element: unknown, width: number, height: number): Promise<Buffer> {
     const svg = await satori(element as unknown as Parameters<typeof satori>[0], {
-      width: 1200,
-      height: 675,
+      width,
+      height,
       fonts: this.loadFonts()
     });
-
-    const resvg = new Resvg(svg, { fitTo: { mode: "width", value: 1200 } });
+    const resvg = new Resvg(svg, { fitTo: { mode: "width", value: width } });
     return Buffer.from(resvg.render().asPng());
   }
 

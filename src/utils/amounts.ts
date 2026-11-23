@@ -77,6 +77,23 @@ export function nativeAtomicToUsd(
 }
 
 /**
+ * Converts a USD/USDT amount -> exact native atomic units using high-precision integer math.
+ */
+export function usdToNativeAtomic(
+  usdAmount: number,
+  nativeDecimals: number,
+  nativePriceUsd: number
+): bigint {
+  if (!Number.isFinite(usdAmount) || usdAmount <= 0 || usdAmount > 1_000_000_000) return 0n;
+  if (!Number.isFinite(nativePriceUsd) || nativePriceUsd <= 0) return 0n;
+  const usdScaled = floatToScaled18(usdAmount);
+  const priceScaled = floatToScaled18(nativePriceUsd);
+  if (priceScaled <= 0n) return 0n;
+  const nativeScale = 10n ** BigInt(nativeDecimals);
+  return (usdScaled * nativeScale) / priceScaled;
+}
+
+/**
  * Computes how many token atomic units are received when spending `nativeNetAtomic`
  * at effective token price `tokenPriceNative` (expressed in native per 1 token).
  */

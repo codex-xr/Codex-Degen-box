@@ -1,17 +1,54 @@
 import http from "node:http";
 import { PublicKey } from "@solana/web3.js";
 import { erc20Abi, parseAbiItem, PublicClient } from "viem";
-import { ChainKey, CHAINS, normalizeAddress } from "../chains/registry.js";
+import {
+  ChainKey,
+  CHAINS,
+  EVM_CHAIN_KEYS,
+  EvmChainKey,
+  normalizeAddress
+} from "../chains/registry.js";
 import { AppConfig } from "../config.js";
 import { IAdminDb, IVaultManager, WatchedWalletRow } from "../db/types.js";
+import { atomicToNumber } from "../utils/amounts.js";
 import { CopyEngine, DetectedWalletSwap } from "./copyEngine.js";
 import { EvmClientManager } from "./evmClients.js";
 import { SolanaClientManager } from "./solanaClient.js";
+
+export interface DetectedWalletTransfer {
+  chain: ChainKey;
+  walletAddress: string;
+  txHash: string;
+  direction: "in" | "out";
+  counterparty: string;
+  amountNative: number;
+  symbol: string;
+  detectedAt: number;
+}
+
+export type TransferAlertCallback = (
+  telegramId: string,
+  wallet: WatchedWalletRow,
+  transfer: DetectedWalletTransfer
+) => Promise<void>;
 
 interface WatcherTarget {
   telegramId: string;
   wallet: WatchedWalletRow;
 }
+
+const SOL_SYSTEM_SKIP = new Set([
+  "11111111111111111111111111111111",
+  "ComputeBudget111111111111111111111111111111",
+  "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+  "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+  "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+  "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+  "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+  "ADuUkR4vqLUMWXx9gh6D6L8pMSawimctcNZ5pGwDcEt",
+  "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+  "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"
+]);
 
 const TRANSFER_EVENT = parseAbiItem(
   "event Transfer(address indexed from, address indexed to, uint256 value)"
@@ -28,12 +65,13 @@ export class WalletWatcherService {
   private readonly evmClients: EvmClientManager;
   private readonly solanaClient: SolanaClientManager;
   private readonly copyEngine: CopyEngine;
+  private readonly onTransferAlert?: TransferAlertCallback;
 
   // Map key = `${chain}:${normalizedAddress}` -> list of user watchers
   private targets = new Map<string, WatcherTarget[]>();
   private solanaSubscriptions = new Map<string, number>();
   private solanaLastSigs = new Map<string, string>();
-  private evmLastBlocks = new Map<"base" | "robinhood", bigint>();
+  private evmLastBlocks = new Map<EvmChainKey, bigint>();
   private seenTxKeys = new Set<string>();
 
   private evmTimer: NodeJS.Timeout | null = null;
@@ -49,6 +87,7 @@ export class WalletWatcherService {
     evmClients: EvmClientManager;
     solanaClient: SolanaClientManager;
     copyEngine: CopyEngine;
+    onTransferAlert?: TransferAlertCallback;
   }) {
     this.config = params.config;
     this.adminDb = params.adminDb;
@@ -56,6 +95,7 @@ export class WalletWatcherService {
     this.evmClients = params.evmClients;
     this.solanaClient = params.solanaClient;
     this.copyEngine = params.copyEngine;
+    this.onTransferAlert = params.onTransferAlert;
   }
 
   async start(): Promise<void> {
@@ -197,17 +237,18 @@ export class WalletWatcherService {
     const dedupKey = `solana:${walletAddress}:${signature}`;
     if (this.markSeen(dedupKey)) return;
 
-    const swap = await this.parseSolanaSwap(walletAddress, signature);
-    if (!swap) return;
-
-    await this.dispatchSwap(swap);
+    const result = await this.inspectSolanaTx(walletAddress, signature);
+    if (result?.swap) {
+      await this.dispatchSwap(result.swap);
+    } else if (result?.transfer) {
+      await this.dispatchTransfer(result.transfer);
+    }
   }
 
-  /**
-   * Parses a confirmed Solana transaction into a Buy or Sell using Helius Enhanced API
-   * when available, falling back to native pre/post token & SOL balance diffs.
-   */
-  async parseSolanaSwap(walletAddress: string, signature: string): Promise<DetectedWalletSwap | null> {
+  private async inspectSolanaTx(
+    walletAddress: string,
+    signature: string
+  ): Promise<{ swap?: DetectedWalletSwap; transfer?: DetectedWalletTransfer } | null> {
     if (this.config.heliusApiKey) {
       try {
         const res = await fetch(
@@ -243,7 +284,31 @@ export class WalletWatcherService {
           const tx = txs[0];
           if (tx) {
             const parsed = this.extractSwapFromHeliusTx(walletAddress, signature, tx);
-            if (parsed) return parsed;
+            if (parsed) return { swap: parsed };
+
+            const bigNative = (tx.nativeTransfers ?? []).find(
+              (nt) =>
+                (nt.fromUserAccount === walletAddress || nt.toUserAccount === walletAddress) &&
+                Number(nt.amount ?? 0) >= 50_000_000
+            );
+            if (bigNative) {
+              const isOut = bigNative.fromUserAccount === walletAddress;
+              const other = isOut ? bigNative.toUserAccount : bigNative.fromUserAccount;
+              if (other && other !== walletAddress && !SOL_SYSTEM_SKIP.has(other)) {
+                return {
+                  transfer: {
+                    chain: "solana",
+                    walletAddress,
+                    txHash: signature,
+                    direction: isOut ? "out" : "in",
+                    counterparty: other,
+                    amountNative: Number(bigNative.amount) / 1e9,
+                    symbol: "SOL",
+                    detectedAt: Date.now()
+                  }
+                };
+              }
+            }
           }
         }
       } catch {
@@ -253,15 +318,66 @@ export class WalletWatcherService {
 
     try {
       const parsedTx = await this.solanaClient.connection.getParsedTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
+        maxSupportedTransactionVersion: 1 as 0,
         commitment: "confirmed"
       });
       if (!parsedTx || !parsedTx.meta || parsedTx.meta.err) return null;
 
-      return this.extractSwapFromSolanaBalanceDiffs(walletAddress, signature, parsedTx);
+      const swap = this.extractSwapFromSolanaBalanceDiffs(walletAddress, signature, parsedTx);
+      if (swap) return { swap };
+
+      const transfer = this.extractTransferFromSolanaBalanceDiffs(walletAddress, signature, parsedTx);
+      if (transfer) return { transfer };
+      return null;
     } catch {
       return null;
     }
+  }
+
+  private extractTransferFromSolanaBalanceDiffs(
+    walletAddress: string,
+    signature: string,
+    parsedTx: NonNullable<Awaited<ReturnType<SolanaClientManager["connection"]["getParsedTransaction"]>>>
+  ): DetectedWalletTransfer | null {
+    const meta = parsedTx.meta;
+    if (!meta) return null;
+    const keys = parsedTx.transaction.message.accountKeys.map((k) => k.pubkey.toBase58() as string);
+    const idx = keys.indexOf(walletAddress);
+    if (idx < 0) return null;
+
+    const delta = Number(BigInt(meta.postBalances[idx] ?? 0) - BigInt(meta.preBalances[idx] ?? 0)) / 1e9;
+    if (Math.abs(delta) < 0.05) return null;
+
+    for (let i = 0; i < keys.length; i++) {
+      const other = keys[i];
+      if (!other || other === walletAddress || SOL_SYSTEM_SKIP.has(other)) continue;
+      const otherDelta = Number(BigInt(meta.postBalances[i] ?? 0) - BigInt(meta.preBalances[i] ?? 0)) / 1e9;
+      if (delta < -0.05 && otherDelta > 0.04) {
+        return {
+          chain: "solana",
+          walletAddress,
+          txHash: signature,
+          direction: "out",
+          counterparty: other,
+          amountNative: Math.min(-delta, otherDelta),
+          symbol: "SOL",
+          detectedAt: Date.now()
+        };
+      }
+      if (delta > 0.05 && otherDelta < -0.04) {
+        return {
+          chain: "solana",
+          walletAddress,
+          txHash: signature,
+          direction: "in",
+          counterparty: other,
+          amountNative: Math.min(delta, -otherDelta),
+          symbol: "SOL",
+          detectedAt: Date.now()
+        };
+      }
+    }
+    return null;
   }
 
   private extractSwapFromHeliusTx(
@@ -421,17 +537,21 @@ export class WalletWatcherService {
     if (this.evmBusy) return;
     this.evmBusy = true;
     try {
-      await Promise.all([this.scanEvmChain("base"), this.scanEvmChain("robinhood")]);
+      await Promise.all(EVM_CHAIN_KEYS.map((chain) => this.scanEvmChain(chain)));
     } finally {
       this.evmBusy = false;
     }
   }
 
-  private async scanEvmChain(chain: "base" | "robinhood"): Promise<void> {
+  private async scanEvmChain(chain: EvmChainKey): Promise<void> {
     const watched = new Set<string>();
-    for (const key of this.targets.keys()) {
+    let hasTransferAlerts = false;
+    for (const [key, targets] of this.targets.entries()) {
       if (key.startsWith(`${chain}:`)) {
         watched.add(key.slice(chain.length + 1) as `0x${string}`);
+        if (targets.some((t) => t.wallet.transferAlerts)) {
+          hasTransferAlerts = true;
+        }
       }
     }
     if (watched.size === 0) return;
@@ -491,13 +611,57 @@ export class WalletWatcherService {
       for (const [txHash, wallets] of txsToInspect.entries()) {
         await this.inspectEvmTransaction(chain, client, txHash as `0x${string}`, [...wallets]);
       }
+
+      // Check direct native ETH transfers in up to latest 2 blocks if transferAlerts is enabled
+      if (hasTransferAlerts && this.onTransferAlert) {
+        const startNativeBlk = latestBlock - fromBlock > 1n ? latestBlock - 1n : fromBlock;
+        for (let blk = startNativeBlk; blk <= latestBlock; blk++) {
+          const block = await client.getBlock({ blockNumber: blk, includeTransactions: true }).catch(() => null);
+          if (!block) continue;
+          for (const tx of block.transactions) {
+            if (typeof tx === "string") continue;
+            const from = tx.from.toLowerCase();
+            const to = tx.to?.toLowerCase() ?? "";
+            if (!to || (tx.input && tx.input.length > 2) || tx.value < 5_000_000_000_000_000n) continue;
+            if (watched.has(from) && !watched.has(to)) {
+              const dedup = `${chain}:${from}:${tx.hash}:xfer`;
+              if (!this.markSeen(dedup)) {
+                await this.dispatchTransfer({
+                  chain,
+                  walletAddress: from,
+                  txHash: tx.hash,
+                  direction: "out",
+                  counterparty: to,
+                  amountNative: atomicToNumber(tx.value, 18),
+                  symbol: "ETH",
+                  detectedAt: Date.now()
+                });
+              }
+            } else if (watched.has(to) && !watched.has(from)) {
+              const dedup = `${chain}:${to}:${tx.hash}:xfer`;
+              if (!this.markSeen(dedup)) {
+                await this.dispatchTransfer({
+                  chain,
+                  walletAddress: to,
+                  txHash: tx.hash,
+                  direction: "in",
+                  counterparty: from,
+                  amountNative: atomicToNumber(tx.value, 18),
+                  symbol: "ETH",
+                  detectedAt: Date.now()
+                });
+              }
+            }
+          }
+        }
+      }
     } catch {
       // Transient RPC log query failure
     }
   }
 
   private async inspectEvmTransaction(
-    chain: "base" | "robinhood",
+    chain: EvmChainKey,
     client: PublicClient,
     txHash: `0x${string}`,
     walletAddresses: string[]
@@ -621,6 +785,19 @@ export class WalletWatcherService {
 
     await Promise.all(
       watchers.map((w) => this.copyEngine.processSwapForUser(w.telegramId, w.wallet, swap))
+    );
+  }
+
+  private async dispatchTransfer(transfer: DetectedWalletTransfer): Promise<void> {
+    if (!this.onTransferAlert) return;
+    const key = `${transfer.chain}:${normalizeAddress(transfer.chain, transfer.walletAddress)}`;
+    const watchers = this.targets.get(key);
+    if (!watchers || watchers.length === 0) return;
+
+    await Promise.all(
+      watchers
+        .filter((t) => t.wallet.transferAlerts)
+        .map((t) => this.onTransferAlert!(t.telegramId, t.wallet, transfer))
     );
   }
 

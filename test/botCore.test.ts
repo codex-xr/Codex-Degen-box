@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { ChainKey } from "../src/chains/registry.js";
 import { AdminDb } from "../src/db/adminDb.js";
 import { UserVaultManager } from "../src/db/userVault.js";
 import { loadConfig } from "../src/config.js";
@@ -13,8 +14,9 @@ import { PnlCardRenderer } from "../src/services/pnlCard.js";
 import { SecurityService, TokenSecurityReport } from "../src/services/security.js";
 import { SolanaClientManager } from "../src/services/solanaClient.js";
 import { TradingEngine } from "../src/services/tradingEngine.js";
+import { WalletDetectiveService, WalletInvestigationReport } from "../src/services/walletDetective.js";
 import { WeeklyReportService } from "../src/services/weeklyReport.js";
-import { formatExactUnits, parseExactUnits } from "../src/utils/amounts.js";
+import { formatExactUnits, parseExactUnits, usdToNativeAtomic } from "../src/utils/amounts.js";
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -52,7 +54,7 @@ function makeFakeSnap(overrides: Partial<TokenSnapshot> = {}): TokenSnapshot {
   };
 }
 
-function makeSafeSecurity(chain: "solana" | "base" | "robinhood" = "solana"): TokenSecurityReport {
+function makeSafeSecurity(chain: ChainKey = "solana"): TokenSecurityReport {
   return {
     chain,
     address: "So111TokenMint11111111111111111111111111111",
@@ -334,5 +336,131 @@ test("PnL card renderer produces valid PNG image buffer across themes", async ()
     assert.ok(png.length > 5000);
     // PNG magic bytes: 89 50 4E 47 0D 0A 1A 0A
     assert.equal(png.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  }
+});
+
+test("USDT conversion, Ethereum EVM chain, wallet rename, wallet-by-wallet investigation & Detective PNG card", async () => {
+  const tmp = makeTempDir("degen-detective-");
+  const config = loadConfig({ dataDir: tmp });
+  const adminDb = new AdminDb(config.adminDbPath, 10);
+  const vaults = new UserVaultManager(config.userVaultDir);
+  try {
+    const evm = new EvmClientManager(config);
+    const sol = new SolanaClientManager(config);
+    const market = new MarketDataService(config, evm, sol);
+
+    // Verify USDT -> SOL atomic conversion ($200 USDT @ $200/SOL = 1 SOL)
+    const convertedSol = usdToNativeAtomic(200, 9, 200);
+    assert.equal(convertedSol, 1_000_000_000n);
+
+    const vault = await vaults.getVault("888");
+    const balEth = await vault.addVirtualFunds("ethereum", parseExactUnits("0.25", 18));
+    assert.equal(balEth, parseExactUnits("0.25", 18));
+    const balAfterTopup = await vault.addVirtualFunds("solana", convertedSol);
+    assert.equal(balAfterTopup, 1_000_000_000n);
+
+    // Add wallet with alias and rename it, plus $0 watch-only mode
+    const wid = await vault.addWatchedWallet({
+      chain: "solana",
+      address: "VaultWallet11111111111111111111111111111111",
+      alias: "OldStorageName",
+      copyMode: "fixed",
+      copyAmountAtomic: 0n
+    });
+    await vault.updateWatchedWallet(wid, { alias: "MainColdVault" });
+    const renamed = (await vault.getWatchedWallet(wid))!;
+    assert.equal(renamed.alias, "MainColdVault");
+    assert.equal(renamed.transferAlerts, true);
+
+    // Mock WalletDetectiveService for offline unit testing of wallet-by-wallet reporting + PNG card
+    const detective = new WalletDetectiveService({ config, evmClients: evm, solanaClient: sol, market });
+    const sampleReport: WalletInvestigationReport = {
+      chain: "solana",
+      address: renamed.address,
+      days: 7,
+      roleSummary: "🧊 Storage / Transfer Vault",
+      balanceNative: 42.5,
+      nativeBalanceStr: "42.5",
+      nativeSymbol: "SOL",
+      nativeUsd: 8500,
+      topHoldings: [{ symbol: "USDC", address: "EPjF", amountStr: "1200", usdValue: 1200 }],
+      totalHoldingsUsd: 9700,
+      activityCount: 14,
+      swapsCount: 0,
+      transfersCount: 14,
+      lastActiveAtMs: Date.now() - 3600_000,
+      peakHoursUtc: "14:00–17:00 UTC",
+      tradingStyle: "Transfer / Storage vault",
+      firstFunder: { address: "BinanceHot", label: "Binance Hot", amountNative: 50, timestampMs: Date.now() - 86400_000 },
+      identity: {
+        domains: ["vaultking.sol"],
+        twitterHandles: ["vault_king_sol"],
+        farcasterHandles: [],
+        pumpUsername: null,
+        pumpFollowers: null,
+        linkedEvmWallet: "0x1234567890123456789012345678901234567890",
+        linkedSolWallet: null,
+        coinSocialTwitters: []
+      },
+      launchedCount: 1,
+      launchedCoins: [{ name: "VaultCat", symbol: "VCAT", address: "Mint1", mcUsd: 150000, graduated: true, twitter: "vault_king_sol", createdAtMs: null }],
+      connectedWallets: [
+        {
+          address: "SniperBuddy11111111111111111111111111111111",
+          label: "sniper.sol",
+          isExchangeOrApp: false,
+          interactionsCount: 9,
+          inflowNative: 12.4,
+          outflowNative: 0,
+          directionTag: "⬅️ Sent funds INTO this wallet",
+          tokenMovesCount: 2,
+          lastInteractionAtMs: Date.now() - 1800_000,
+          activityCount: 38,
+          lastActiveAtMs: Date.now() - 900_000,
+          swapsCount: 31,
+          nativeBalance: 6.2,
+          nativeUsd: 1240,
+          topHolding: "$BONK (50000)",
+          totalHoldingsUsd: 1500,
+          launchedCount: 2,
+          launchedCoins: [{ name: "MemeOne", symbol: "MEME", address: "Mint2", mcUsd: 80000, graduated: false, twitter: "sniper_x", createdAtMs: null }],
+          identity: {
+            domains: ["sniper.sol"],
+            twitterHandles: ["sniper_x"],
+            farcasterHandles: [],
+            pumpUsername: "sniper_pump",
+            pumpFollowers: 420,
+            linkedEvmWallet: null,
+            linkedSolWallet: null,
+            coinSocialTwitters: []
+          },
+          roleBadge: "🪙🔥 Launcher & Trader",
+          tradingStyle: "High-frequency trader",
+          hop2Targets: [{ address: "Hop2Wallet11111111111111111111111111111111", label: null, count: 4, direction: "out" }]
+        }
+      ],
+      crossChainGlances: [],
+      notes: [],
+      generatedAt: Date.now()
+    };
+    detective.investigateWallet = async () => sampleReport;
+
+    const reports = new WeeklyReportService({ config, adminDb, vaultManager: vaults, market, detective });
+    const perWallet = await reports.generateForWatchedWallet(vault, wid, 7);
+    assert.ok(perWallet);
+    assert.match(perWallet.formattedText, /MainColdVault/);
+    assert.match(perWallet.formattedText, /sniper\.sol/);
+    assert.match(perWallet.formattedText, /@vault\\_king\\_sol/);
+    assert.match(perWallet.formattedText, /@sniper\\_x/);
+    assert.match(perWallet.formattedText, /\$VCAT/);
+
+    const renderer = new PnlCardRenderer();
+    const detPng = await renderer.renderDetectivePng(sampleReport, "cyber", "MainColdVault");
+    assert.ok(Buffer.isBuffer(detPng));
+    assert.equal(detPng.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  } finally {
+    await vaults.closeAll();
+    await adminDb.close();
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });

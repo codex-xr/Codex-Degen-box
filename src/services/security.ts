@@ -1,4 +1,4 @@
-import { ChainKey, CHAINS, normalizeAddress } from "../chains/registry.js";
+import { ChainKey, CHAINS, EvmChainKey, normalizeAddress } from "../chains/registry.js";
 
 export type RiskLevel = "safe" | "warning" | "danger" | "unknown";
 
@@ -39,7 +39,7 @@ export class SecurityService {
     return report;
   }
 
-  private async checkEvmToken(chain: "base" | "robinhood", address: string): Promise<TokenSecurityReport> {
+  private async checkEvmToken(chain: EvmChainKey, address: string): Promise<TokenSecurityReport> {
     const goPlusChainId = CHAINS[chain].goPlusChainId;
     const warnings: string[] = [];
     let isHoneypot = false;
