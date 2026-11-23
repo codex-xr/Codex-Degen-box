@@ -1023,6 +1023,65 @@ test("copyEngine copies brand-new unindexed PumpSwap buys via on-chain fallback 
     assert.ok(open[0].entryMcUsd >= 19_000 && open[0].entryMcUsd <= 21_000, `MC=${open[0].entryMcUsd}`);
     assert.ok(notes.some((n) => n.includes("Instant Copy Buy") && n.includes("FRESH")));
 
+    // 3. Deployer mint-all transaction (0.015 SOL fee -> 100% of supply = $1.12 bogus MC) MUST be rejected
+    const mintSnap = await market.buildOnChainSolanaSnapshot({
+      tokenAddress: "FreshPumpMint1111111111111111111111111111111",
+      walletNativeAmountAtomic: 15_254_779n,
+      walletTokenAmount: 1_000_000_000,
+      dex: "onchain"
+    });
+    assert.equal(mintSnap, null);
+
+    // 4. Helius mint-to-self / pass-through pool seeding tx produces 0 swaps
+    const adminDb2 = new AdminDb(config.adminDbPath, 10);
+    const watcher2 = new WalletWatcherService({
+      config,
+      adminDb: adminDb2,
+      vaultManager: vaults,
+      evmClients: evm,
+      solanaClient: sol,
+      copyEngine: copy
+    });
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify([
+          {
+            type: "UNKNOWN",
+            nativeTransfers: [
+              {
+                fromUserAccount: "CreatorWallet1111111111111111111111111111111",
+                toUserAccount: "Sys",
+                amount: 15_254_779
+              }
+            ],
+            tokenTransfers: [
+              {
+                fromUserAccount: "",
+                toUserAccount: "CreatorWallet1111111111111111111111111111111",
+                mint: "FreshPumpMint1111111111111111111111111111111",
+                tokenAmount: 1_000_000_000
+              },
+              {
+                fromUserAccount: "CreatorWallet1111111111111111111111111111111",
+                toUserAccount: "PoolPDA",
+                mint: "FreshPumpMint1111111111111111111111111111111",
+                tokenAmount: 1_000_000_000
+              }
+            ]
+          }
+        ]),
+        { status: 200 }
+      )) as typeof fetch;
+
+    const parsedMintTx = await (
+      watcher2 as unknown as {
+        inspectSolanaTx: (w: string, sig: string) => Promise<{ swaps: unknown[]; fetched: boolean }>;
+      }
+    ).inspectSolanaTx("CreatorWallet1111111111111111111111111111111", "sig_mint_create");
+    assert.equal(parsedMintTx.fetched, true);
+    assert.equal(parsedMintTx.swaps.length, 0);
+
+    await adminDb2.close();
     await vaults.closeAll();
   } finally {
     globalThis.fetch = origFetch;

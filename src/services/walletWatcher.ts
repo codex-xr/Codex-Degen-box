@@ -384,6 +384,18 @@ export class WalletWatcherService {
           }>;
           const tx = txs[0];
           if (tx) {
+            // Skip token mint / creator deploy transactions so mint-to-self never fakes a $1 MC copy-buy
+            const isMintCreationTx =
+              tx.type === "TOKEN_MINT" ||
+              tx.type === "CREATE" ||
+              tx.type === "INITIALIZE_MINT" ||
+              (tx.tokenTransfers ?? []).some(
+                (t) => !t.fromUserAccount && t.toUserAccount === walletAddress && !isQuote(t.mint ?? "")
+              );
+            if (isMintCreationTx) {
+              return { swaps: [], fetched: true };
+            }
+
             const parsed = this.extractSwapsFromHeliusTx(walletAddress, signature, tx);
             if (parsed.length > 0) return { swaps: parsed, fetched: true };
 
@@ -559,14 +571,26 @@ export class WalletWatcherService {
       }
     }
 
-    const boughtToken = [...tokenIn.entries()].find(([mint]) => !isQuote(mint));
-    const soldToken = [...tokenOut.entries()].find(([mint]) => !isQuote(mint));
+    // Use net token deltas so pass-through mint/pool seeding txs net to zero instead of faking buys
+    const netNonQuote = new Map<string, number>();
+    for (const mint of new Set([...tokenIn.keys(), ...tokenOut.keys()])) {
+      if (isQuote(mint)) continue;
+      const net = (tokenIn.get(mint) ?? 0) - (tokenOut.get(mint) ?? 0);
+      if (Math.abs(net) > 1e-12) {
+        netNonQuote.set(mint, net);
+      }
+    }
+    const boughtEntry = [...netNonQuote.entries()].find(([, net]) => net > 0);
+    const soldEntry = [...netNonQuote.entries()].find(([, net]) => net < 0);
+    const boughtToken: [string, number] | undefined = boughtEntry ? [boughtEntry[0], boughtEntry[1]] : undefined;
+    const soldToken: [string, number] | undefined = soldEntry ? [soldEntry[0], -soldEntry[1]] : undefined;
+    const hasQuoteMove = [...new Set([...tokenIn.keys(), ...tokenOut.keys()])].some((m) => isQuote(m));
     const swapEv = tx.events?.swap;
     const swaps: DetectedWalletSwap[] = [];
 
     if (
       soldToken &&
-      (swapEv || tx.type === "SWAP" || tokenIn.size > 0 || nativeInLamports >= 500_000)
+      (swapEv || tx.type === "SWAP" || hasQuoteMove || Boolean(boughtToken) || nativeInLamports >= 500_000)
     ) {
       const nativeAmt = swapEv?.nativeOutput?.amount
         ? BigInt(swapEv.nativeOutput.amount)
@@ -588,7 +612,7 @@ export class WalletWatcherService {
 
     if (
       boughtToken &&
-      (swapEv || tx.type === "SWAP" || tokenOut.size > 0 || nativeOutLamports >= 500_000)
+      (swapEv || tx.type === "SWAP" || hasQuoteMove || Boolean(soldToken) || nativeOutLamports >= 500_000)
     ) {
       const nativeAmt = swapEv?.nativeInput?.amount
         ? BigInt(swapEv.nativeInput.amount)

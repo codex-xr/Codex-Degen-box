@@ -540,22 +540,24 @@ export class MarketDataService {
     }
 
     const decimals = assetMeta.decimals ?? (await this.solanaClient.getTokenDecimals(params.tokenAddress));
+    const supplyTokens = assetMeta.supplyAtomic > 0 ? assetMeta.supplyAtomic / 10 ** decimals : 0;
+
     let priceUsd = assetMeta.pricePerToken;
     if (
       priceUsd <= 0 &&
       params.walletNativeAmountAtomic &&
-      params.walletNativeAmountAtomic >= 5_000_000n &&
+      params.walletNativeAmountAtomic >= 20_000_000n &&
       params.walletTokenAmount &&
-      params.walletTokenAmount > 0
+      params.walletTokenAmount > 0 &&
+      (supplyTokens <= 0 || params.walletTokenAmount < supplyTokens * 0.1)
     ) {
       const nativeSpent = atomicToNumber(params.walletNativeAmountAtomic, CHAINS.solana.nativeDecimals);
       priceUsd = (nativeSpent * nativePriceUsd) / params.walletTokenAmount;
     }
     if (!Number.isFinite(priceUsd) || priceUsd <= 0) return null;
 
-    const supplyTokens = assetMeta.supplyAtomic > 0 ? assetMeta.supplyAtomic / 10 ** decimals : 0;
     const mcUsd = supplyTokens > 0 ? priceUsd * supplyTokens : 0;
-    if (mcUsd > 10_000_000_000) return null;
+    if ((supplyTokens > 0 && mcUsd < 1500) || mcUsd > 10_000_000_000) return null;
 
     const liquidityUsd = params.hasExplicitMinLiq
       ? 0
