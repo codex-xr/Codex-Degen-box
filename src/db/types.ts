@@ -229,6 +229,7 @@ export interface IUserVault {
   addVirtualFunds(chain: ChainKey, addAtomic: bigint): Promise<bigint>;
   adjustBalance(chain: ChainKey, deltaAtomic: bigint): Promise<bigint>;
   getSettings(): Promise<UserSettings>;
+  getSetting(key: string): Promise<string | null>;
   setSetting(key: string, value: string): Promise<void>;
   getOpenPosition(chain: ChainKey, tokenAddress: string, copiedWalletId?: number | null): Promise<PositionRow | null>;
   getPositionById(id: number): Promise<PositionRow | null>;

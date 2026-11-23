@@ -167,14 +167,12 @@ export class TradingEngine {
     const out = await vault.runInTransaction(async () => {
       const remainingBalanceAtomic = await vault.adjustBalance(req.chain, -totalWalletDebit);
 
-      // Keep copied positions isolated per watched wallet for clean weekly attribution
-      const existingPos =
-        req.sourceType === "copy" && req.copiedWalletId
-          ? await vault.getOpenPosition(req.chain, req.tokenAddress, req.copiedWalletId)
-          : await vault.getOpenPosition(req.chain, req.tokenAddress);
+      // Keep manual/limit/DCA positions isolated from copied-wallet positions
+      const targetWalletId = req.sourceType === "copy" && req.copiedWalletId ? req.copiedWalletId : null;
+      const existingPos = await vault.getOpenPosition(req.chain, req.tokenAddress, targetWalletId);
 
       let positionId: number;
-      if (existingPos && (req.sourceType !== "copy" || existingPos.copiedWalletId === req.copiedWalletId)) {
+      if (existingPos) {
         positionId = existingPos.id;
         await vault.addToPosition({
           id: positionId,

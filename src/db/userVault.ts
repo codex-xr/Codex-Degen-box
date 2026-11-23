@@ -357,6 +357,13 @@ export class UserVault implements IUserVault {
     };
   }
 
+  async getSetting(key: string): Promise<string | null> {
+    const row = this.db.prepare(`SELECT value FROM user_settings WHERE key = ?`).get(key) as
+      | { value?: string }
+      | undefined;
+    return row?.value ?? null;
+  }
+
   async setSetting(key: string, value: string): Promise<void> {
     this.db
       .prepare(
@@ -373,21 +380,29 @@ export class UserVault implements IUserVault {
   ): Promise<PositionRow | null> {
     const norm = normalizeAddress(chain, tokenAddress);
     const row =
-      copiedWalletId !== undefined && copiedWalletId !== null
+      copiedWalletId === null
         ? (this.db
             .prepare(
               `SELECT * FROM positions
-               WHERE status = 'open' AND chain = ? AND token_address = ? AND copied_wallet_id = ?
+               WHERE status = 'open' AND chain = ? AND token_address = ? AND copied_wallet_id IS NULL
                ORDER BY id DESC LIMIT 1`
             )
-            .get(chain, norm, copiedWalletId) as Record<string, unknown> | undefined)
-        : (this.db
-            .prepare(
-              `SELECT * FROM positions
-               WHERE status = 'open' AND chain = ? AND token_address = ?
-               ORDER BY id DESC LIMIT 1`
-            )
-            .get(chain, norm) as Record<string, unknown> | undefined);
+            .get(chain, norm) as Record<string, unknown> | undefined)
+        : copiedWalletId !== undefined
+          ? (this.db
+              .prepare(
+                `SELECT * FROM positions
+                 WHERE status = 'open' AND chain = ? AND token_address = ? AND copied_wallet_id = ?
+                 ORDER BY id DESC LIMIT 1`
+              )
+              .get(chain, norm, copiedWalletId) as Record<string, unknown> | undefined)
+          : (this.db
+              .prepare(
+                `SELECT * FROM positions
+                 WHERE status = 'open' AND chain = ? AND token_address = ?
+                 ORDER BY id DESC LIMIT 1`
+              )
+              .get(chain, norm) as Record<string, unknown> | undefined);
     return row ? this.mapPosition(row) : null;
   }
 

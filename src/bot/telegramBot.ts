@@ -32,11 +32,14 @@ import {
   usdToNativeAtomic
 } from "../utils/amounts.js";
 import {
+  chainFromShortCode,
   escapeMd,
   formatHomeMessage,
   formatPositionMessage,
   formatTokenScanMessage,
-  formatWatchedWalletMessage
+  formatWatchedWalletMessage,
+  shortChainCode,
+  stripMdForFallback
 } from "./formatters.js";
 import {
   buildAdminKeyboard,
@@ -56,7 +59,7 @@ import {
   buildWatcherDetailKeyboard,
   buildWatchersKeyboard
 } from "./keyboards.js";
-import { SessionStore } from "./sessionState.js";
+import { PendingPrompt, SessionStore } from "./sessionState.js";
 
 export interface BotServices {
   config: AppConfig;
@@ -71,18 +74,10 @@ export interface BotServices {
   walletWatcher: WalletWatcherService;
 }
 
-const SHORT_CHAIN_MAP: Record<string, ChainKey> = {
-  s: "solana",
-  e: "ethereum",
-  b: "base",
-  r: "robinhood"
-};
+export { shortChainCode };
 
-export function shortChainCode(chain: ChainKey): string {
-  if (chain === "solana") return "s";
-  if (chain === "ethereum") return "e";
-  if (chain === "base") return "b";
-  return "r";
+function cleanDecimalInput(raw: string): string {
+  return raw.replace(/[$,\s]/g, "");
 }
 
 function splitTelegramChunks(text: string, maxLen = 3800): string[] {
@@ -137,6 +132,37 @@ export function createTelegramBot(services: BotServices): Bot {
     return id;
   };
 
+  const setPrompt = (telegramId: string, prompt: PendingPrompt, vault?: IUserVault) => {
+    sessions.set(telegramId, prompt);
+    if (vault && prompt.kind !== "await_access_code") {
+      void vault.setSetting("__pending_prompt", JSON.stringify(prompt)).catch(() => {});
+    }
+  };
+
+  const clearPrompt = (telegramId: string, vault?: IUserVault) => {
+    sessions.clear(telegramId);
+    if (vault) {
+      void vault.setSetting("__pending_prompt", "").catch(() => {});
+    }
+  };
+
+  const getPrompt = async (telegramId: string, vault: IUserVault): Promise<PendingPrompt | undefined> => {
+    const cached = sessions.get(telegramId);
+    if (cached) return cached;
+    try {
+      const raw = await vault.getSetting("__pending_prompt");
+      if (!raw) return undefined;
+      const parsed = JSON.parse(raw) as PendingPrompt;
+      if (parsed && typeof parsed === "object" && "kind" in parsed) {
+        sessions.set(telegramId, parsed);
+        return parsed;
+      }
+    } catch {
+      // ignore invalid stored prompt
+    }
+    return undefined;
+  };
+
   const getUserId = (ctx: Context): string | null =>
     ctx.from?.id !== undefined ? String(ctx.from.id) : null;
 
@@ -148,7 +174,7 @@ export function createTelegramBot(services: BotServices): Bot {
         link_preview_options: { is_disabled: true }
       });
     } catch {
-      return await ctx.reply(text.replace(/[*_`]/g, ""), {
+      return await ctx.reply(stripMdForFallback(text), {
         reply_markup: kb,
         link_preview_options: { is_disabled: true }
       });
@@ -170,16 +196,27 @@ export function createTelegramBot(services: BotServices): Bot {
           reply_markup: kb,
           link_preview_options: { is_disabled: true }
         });
-      } catch {
-        // Message unchanged or uneditable -> send fresh message
+      } catch (err) {
+        const msg = (err as Error)?.message ?? "";
+        if (/message is not modified/i.test(msg)) return;
+        if (/can't parse entities/i.test(msg)) {
+          try {
+            return await ctx.editMessageText(stripMdForFallback(text), {
+              reply_markup: kb,
+              link_preview_options: { is_disabled: true }
+            });
+          } catch {
+            // Fall through to fresh message
+          }
+        }
       }
     }
     return safeReply(ctx, text, kb);
   };
 
   const showHome = async (ctx: Context, telegramId: string, edit = false) => {
-    sessions.clear(telegramId);
     const vault = await services.vaultManager.getVault(telegramId);
+    clearPrompt(telegramId, vault);
     const isAdmin = await services.adminDb.isAdmin(telegramId);
     const msg = await formatHomeMessage(vault, isAdmin);
     const kb = buildHomeKeyboard(isAdmin);
@@ -324,7 +361,8 @@ export function createTelegramBot(services: BotServices): Bot {
       `🔍 Found this token on multiple chains! Which chain do you want to trade on?`,
       buildDisambiguateChainKeyboard(
         snaps.map((s) => s.chain),
-        refMap
+        refMap,
+        trimmed
       )
     );
   };
@@ -380,12 +418,20 @@ export function createTelegramBot(services: BotServices): Bot {
       traderHandle
     });
 
-    await ctx.replyWithPhoto(new InputFile(png, `pnl-${pos.tokenSymbol}.png`), {
-      caption: `🖼️ *${pos.tokenSymbol}* (${spec.name}) • ${roiPct >= 0 ? "+" : ""}${roiPct.toFixed(1)}% (${
-        pnlUsd >= 0 ? "+" : ""
-      }${formatUsd(pnlUsd)})`,
-      parse_mode: "Markdown"
-    });
+    const safeFileSym = pos.tokenSymbol.replace(/[^a-zA-Z0-9_-]/g, "_") || "token";
+    const caption = `🖼️ *${escapeMd(pos.tokenSymbol)}* (${spec.name}) • ${roiPct >= 0 ? "+" : ""}${roiPct.toFixed(1)}% (${
+      pnlUsd >= 0 ? "+" : ""
+    }${formatUsd(pnlUsd)})`;
+    try {
+      await ctx.replyWithPhoto(new InputFile(png, `pnl-${safeFileSym}.png`), {
+        caption,
+        parse_mode: "Markdown"
+      });
+    } catch {
+      await ctx.replyWithPhoto(new InputFile(png, `pnl-${safeFileSym}.png`), {
+        caption: stripMdForFallback(caption)
+      });
+    }
   };
 
   // === Commands ===
@@ -477,7 +523,7 @@ export function createTelegramBot(services: BotServices): Bot {
     if (!ok) return;
     const parts = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
     if (parts.length === 0) {
-      sessions.set(ok.telegramId, { kind: "await_buy_token_ca" });
+      setPrompt(ok.telegramId, { kind: "await_buy_token_ca" }, ok.vault);
       await safeReply(ctx, "⚡ Paste the *token address* you want to scan or buy:");
       return;
     }
@@ -742,7 +788,7 @@ export function createTelegramBot(services: BotServices): Bot {
       if (data === "nav:help") return await showHelpScreen(ctx, true);
 
       if (data === "nav:scan") {
-        sessions.set(telegramId, { kind: "await_buy_token_ca" });
+        setPrompt(telegramId, { kind: "await_buy_token_ca" }, vault);
         return await safeReply(
           ctx,
           "⚡ Paste any *token or wallet address* from Solana, Ethereum, Base, or Robinhood Chain right now:"
@@ -828,7 +874,7 @@ export function createTelegramBot(services: BotServices): Bot {
           ctx,
           `${spec.emoji} *${spec.name} Virtual Balance*\nCurrent: \`${formatExactUnits(bal, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
             nativePriceUsd > 0 ? ` (~*${formatUsd(usdVal)} USDT*)` : ""
-          }${rateStr}\n\nPick a quick **+Add** button, add by exact **USDT dollar value**, or set a new balance:`,
+          }${rateStr}\n\nPick a quick *+Add* button, add by exact *USDT dollar value*, or set a new balance:`,
           buildEditChainFundsKeyboard(chain, nativePriceUsd)
         );
       }
@@ -858,7 +904,7 @@ export function createTelegramBot(services: BotServices): Bot {
         const chain = parts[2];
         const spec = CHAINS[chain];
         const price = await services.market.getNativePriceUsd(chain).catch(() => 0);
-        sessions.set(telegramId, { kind: "await_add_balance_native", chain });
+        setPrompt(telegramId, { kind: "await_add_balance_native", chain }, vault);
         return await safeReply(
           ctx,
           `➕ How much *${spec.nativeSymbol}* do you want to *ADD* to *${spec.name}*?\n${
@@ -871,7 +917,7 @@ export function createTelegramBot(services: BotServices): Bot {
         const chain = parts[2];
         const spec = CHAINS[chain];
         const price = await services.market.getNativePriceUsd(chain).catch(() => 0);
-        sessions.set(telegramId, { kind: "await_add_balance_usd", chain });
+        setPrompt(telegramId, { kind: "await_add_balance_usd", chain }, vault);
         return await safeReply(
           ctx,
           `💵 Type the *USDT dollar amount* you want to *ADD* to your *${spec.name}* balance:\n${
@@ -896,7 +942,7 @@ export function createTelegramBot(services: BotServices): Bot {
         const chain = parts[2];
         const spec = CHAINS[chain];
         const price = await services.market.getNativePriceUsd(chain).catch(() => 0);
-        sessions.set(telegramId, { kind: "await_set_balance", chain });
+        setPrompt(telegramId, { kind: "await_set_balance", chain }, vault);
         return await safeReply(
           ctx,
           `✏️ Type the new TOTAL *${spec.nativeSymbol}* balance for *${spec.name}*:\n${
@@ -905,20 +951,46 @@ export function createTelegramBot(services: BotServices): Bot {
         );
       }
 
-      // Token Trading
-      if (parts[0] === "refreshscan") {
-        const ref = tokenRefs.get(parts[1]);
+      // Token Trading (stateless callbacks + legacy RAM ref fallbacks)
+      const resolveTokenTarget = (kind: "refresh" | "buy" | "custom" | "limit" | "dca") => {
+        if (parts[0] === "rf" && kind === "refresh") {
+          const ch = chainFromShortCode(parts[1]);
+          return ch && parts[2] ? { chain: ch, address: parts[2] } : undefined;
+        }
+        if (parts[0] === "b" && kind === "buy") {
+          const ch = chainFromShortCode(parts[1]);
+          return ch && parts[2] ? { chain: ch, address: parts[2], amount: parts[3] } : undefined;
+        }
+        if (parts[0] === "bc" && kind === "custom") {
+          const ch = chainFromShortCode(parts[1]);
+          return ch && parts[2] ? { chain: ch, address: parts[2] } : undefined;
+        }
+        if (parts[0] === "lb" && kind === "limit") {
+          const ch = chainFromShortCode(parts[1]);
+          return ch && parts[2] ? { chain: ch, address: parts[2] } : undefined;
+        }
+        if (parts[0] === "db" && kind === "dca") {
+          const ch = chainFromShortCode(parts[1]);
+          return ch && parts[2] ? { chain: ch, address: parts[2] } : undefined;
+        }
+        return undefined;
+      };
+
+      if (parts[0] === "rf" || parts[0] === "refreshscan") {
+        const ref = resolveTokenTarget("refresh") ?? tokenRefs.get(parts[1]);
         if (!ref) return await safeReply(ctx, "⚠️ Token session expired. Please paste the token address again.");
         const snap = await services.market.getTokenSnapshot(ref.chain, ref.address, 500);
         if (!snap) return await safeReply(ctx, "❌ Could not refresh token data.");
         return await sendTokenCard(ctx, telegramId, snap, true);
       }
 
-      if (parts[0] === "buy") {
-        const ref = tokenRefs.get(parts[1]);
-        if (!ref) return await safeReply(ctx, "⚠️ Please paste the token address again.");
+      if (parts[0] === "b" || parts[0] === "buy") {
+        const direct = resolveTokenTarget("buy");
+        const ref = direct ?? tokenRefs.get(parts[1]);
+        const amtRaw = direct ? direct.amount : parts[2];
+        if (!ref || !amtRaw) return await safeReply(ctx, "⚠️ Please paste the token address again.");
         const spec = CHAINS[ref.chain];
-        const spendAtomic = parseExactUnits(parts[2], spec.nativeDecimals);
+        const spendAtomic = parseExactUnits(amtRaw, spec.nativeDecimals);
         const res = await services.trading.executeBuy(vault, {
           chain: ref.chain,
           tokenAddress: ref.address,
@@ -928,45 +1000,45 @@ export function createTelegramBot(services: BotServices): Bot {
         return await sendBuySuccess(ctx, res);
       }
 
-      if (parts[0] === "buycustom") {
-        const ref = tokenRefs.get(parts[1]);
+      if (parts[0] === "bc" || parts[0] === "buycustom") {
+        const ref = resolveTokenTarget("custom") ?? tokenRefs.get(parts[1]);
         if (!ref) return await safeReply(ctx, "⚠️ Please paste the token address again.");
         const spec = CHAINS[ref.chain];
-        sessions.set(telegramId, {
+        setPrompt(telegramId, {
           kind: "await_custom_buy_amount",
           chain: ref.chain,
           tokenAddress: ref.address
-        });
+        }, vault);
         return await safeReply(
           ctx,
           `✏️ How much virtual *${spec.nativeSymbol}* do you want to spend? (Any decimal allowed)`
         );
       }
 
-      if (parts[0] === "limitbuy") {
-        const ref = tokenRefs.get(parts[1]);
+      if (parts[0] === "lb" || parts[0] === "limitbuy") {
+        const ref = resolveTokenTarget("limit") ?? tokenRefs.get(parts[1]);
         if (!ref) return await safeReply(ctx, "⚠️ Please paste the token address again.");
         const spec = CHAINS[ref.chain];
-        sessions.set(telegramId, {
+        setPrompt(telegramId, {
           kind: "await_limit_buy",
           chain: ref.chain,
           tokenAddress: ref.address
-        });
+        }, vault);
         return await safeReply(
           ctx,
           `🎯 *Set Limit Buy*\nSend: \`<target_market_cap_usd> <spend_${spec.nativeSymbol}>\`\nExample: \`50000 0.5\` (buys 0.5 ${spec.nativeSymbol} if Market Cap drops to \$50,000 or below)`
         );
       }
 
-      if (parts[0] === "dcabuy") {
-        const ref = tokenRefs.get(parts[1]);
+      if (parts[0] === "db" || parts[0] === "dcabuy") {
+        const ref = resolveTokenTarget("dca") ?? tokenRefs.get(parts[1]);
         if (!ref) return await safeReply(ctx, "⚠️ Please paste the token address again.");
         const spec = CHAINS[ref.chain];
-        sessions.set(telegramId, {
+        setPrompt(telegramId, {
           kind: "await_dca_buy",
           chain: ref.chain,
           tokenAddress: ref.address
-        });
+        }, vault);
         return await safeReply(
           ctx,
           `🔁 *Set Auto-DCA*\nSend: \`<amount_per_buy> <minutes_between> <number_of_buys>\`\nExample: \`0.2 15 5\` (buys 0.2 ${spec.nativeSymbol} every 15 mins, 5 times)`
@@ -1001,7 +1073,7 @@ export function createTelegramBot(services: BotServices): Bot {
         const posId = Number(parts[1]);
         const pos = await vault.getPositionById(posId);
         if (!pos || pos.status !== "open") return await safeReply(ctx, "❌ Position is no longer open.");
-        sessions.set(telegramId, { kind: "await_custom_sell_amount", positionId: posId });
+        setPrompt(telegramId, { kind: "await_custom_sell_amount", positionId: posId }, vault);
         return await safeReply(
           ctx,
           `✏️ Enter how many *${escapeMd(pos.tokenSymbol)}* tokens to sell, OR enter a percentage like \`33%\`:`
@@ -1011,7 +1083,7 @@ export function createTelegramBot(services: BotServices): Bot {
       if (parts[0] === "posorder") {
         const posId = Number(parts[1]);
         const orderType = parts[2] as "tp" | "sl" | "trailing_stop";
-        sessions.set(telegramId, { kind: "await_pos_order", positionId: posId, orderType });
+        setPrompt(telegramId, { kind: "await_pos_order", positionId: posId, orderType }, vault);
         if (orderType === "tp") {
           return await safeReply(ctx, "🎯 Send: `<profit_percent> <sell_percent>`\nExample: `100 50` (when +100% profit, sell 50%!)");
         }
@@ -1037,7 +1109,7 @@ export function createTelegramBot(services: BotServices): Bot {
 
       if (parts[0] === "watch" && parts[1] === "add" && parts[2] === "chain" && isChainKey(parts[3])) {
         const chain = parts[3];
-        sessions.set(telegramId, { kind: "await_watch_address", chain });
+        setPrompt(telegramId, { kind: "await_watch_address", chain }, vault);
         return await safeReply(
           ctx,
           `${CHAINS[chain].emoji} Paste the *${CHAINS[chain].name} wallet address* you want to watch & copy:`
@@ -1080,7 +1152,7 @@ export function createTelegramBot(services: BotServices): Bot {
         const walletId = Number(parts[2]);
         const w = await vault.getWatchedWallet(walletId);
         if (!w) return;
-        sessions.set(telegramId, { kind: "await_rename_watch", walletId });
+        setPrompt(telegramId, { kind: "await_rename_watch", walletId }, vault);
         return await safeReply(
           ctx,
           `✏️ Type the new nickname for *${escapeMd(w.alias)}* (\`${shortAddress(w.address)}\`):`
@@ -1092,7 +1164,7 @@ export function createTelegramBot(services: BotServices): Bot {
         const w = await vault.getWatchedWallet(walletId);
         if (!w) return;
         const spec = CHAINS[w.chain];
-        sessions.set(telegramId, { kind: "await_edit_watch_amount", walletId });
+        setPrompt(telegramId, { kind: "await_edit_watch_amount", walletId }, vault);
         return await safeReply(
           ctx,
           `💵 Type the new amount of *${spec.nativeSymbol}* to spend per copied trade (e.g. \`0.25\` or \`0.00005\`), a % like \`10%\`, OR \`0\` for Alert & Investigate Only:`
@@ -1102,7 +1174,7 @@ export function createTelegramBot(services: BotServices): Bot {
       if (parts[0] === "watch" && parts[1] === "filter") {
         const walletId = Number(parts[2]);
         const field = parts[3] as "min_mc" | "max_mc" | "min_liq" | "tp_sl";
-        sessions.set(telegramId, { kind: "await_edit_watch_filter", walletId, field });
+        setPrompt(telegramId, { kind: "await_edit_watch_filter", walletId, field }, vault);
         if (field === "tp_sl") {
           return await safeReply(
             ctx,
@@ -1146,6 +1218,8 @@ export function createTelegramBot(services: BotServices): Bot {
           : [];
         const kb = buildWalletReportKeyboard({
           walletId: existing.id,
+          chain: existing.chain,
+          address: existing.address,
           days,
           cardRefId,
           buddyRefs
@@ -1163,13 +1237,64 @@ export function createTelegramBot(services: BotServices): Bot {
         return await safeReplyChunks(ctx, formattedText, kb);
       }
 
-      // Wallet Detective Callbacks
+      // Wallet Detective Callbacks (both stateless and legacy refs)
       if (data === "det:ask") {
-        sessions.set(telegramId, { kind: "await_investigate_address" });
+        setPrompt(telegramId, { kind: "await_investigate_address" }, vault);
         return await safeReply(
           ctx,
           "🕵️‍♂️ Paste ANY wallet address (Solana or `0x...` EVM) right now to inspect connected wallets, balances, coins launched & Twitter links!"
         );
+      }
+
+      if (parts[0] === "dd" && parts.length >= 4) {
+        const targetChain = chainFromShortCode(parts[1]);
+        const addr = parts[2];
+        const days = Math.max(1, Math.min(90, Number(parts[3] ?? 7)));
+        if (!targetChain || !addr || !isValidAddressFormat(targetChain, addr)) {
+          return await safeReply(ctx, "❌ Invalid wallet payload.");
+        }
+        return await runAndSendWalletDetective(ctx, vault, {
+          chain: targetChain,
+          address: normalizeAddress(targetChain, addr),
+          days
+        });
+      }
+
+      if (parts[0] === "de" && parts.length >= 4) {
+        const targetChain = chainFromShortCode(parts[3]);
+        const addr = parts[2];
+        if (!targetChain || !addr || !isValidAddressFormat(targetChain, addr)) {
+          return await safeReply(ctx, "❌ Invalid chain switch payload.");
+        }
+        return await runAndSendWalletDetective(ctx, vault, {
+          chain: targetChain,
+          address: normalizeAddress(targetChain, addr),
+          days: 7
+        });
+      }
+
+      if (parts[0] === "dc" && parts.length >= 3) {
+        const targetChain = chainFromShortCode(parts[1]);
+        const addr = parts[2];
+        if (!targetChain || !addr || !isValidAddressFormat(targetChain, addr)) {
+          return await safeReply(ctx, "❌ Invalid detective card payload.");
+        }
+        const norm = normalizeAddress(targetChain, addr);
+        const watchedMatch = (await vault.listWatchedWallets(false)).find(
+          (w) => w.chain === targetChain && normalizeAddress(w.chain, w.address) === norm
+        );
+        const cachedRef = detectiveRefs.get(
+          crypto.createHash("sha256").update(`det:${targetChain}:${norm}`).digest("hex").slice(0, 10)
+        );
+        const report =
+          cachedRef?.report ?? (await services.detective.investigateWallet(targetChain, norm, 7));
+        const s = await vault.getSettings();
+        const alias = cachedRef?.alias ?? watchedMatch?.alias;
+        const png = await services.pnlCards.renderDetectivePng(report, s.pnlTheme, alias);
+        return await ctx.replyWithPhoto(new InputFile(png, `detective-${shortAddress(norm, 4, 4)}.png`), {
+          caption: `🕵️‍♂️ *Wallet Detective Card* • ${CHAINS[targetChain].shortBadge} • \`${shortAddress(norm)}\``,
+          parse_mode: "Markdown"
+        });
       }
 
       if (parts[0] === "det" && parts[1] === "go") {
@@ -1222,11 +1347,11 @@ export function createTelegramBot(services: BotServices): Bot {
       if (parts[0] === "det" && parts[1] === "watch") {
         const ref = detectiveRefs.get(parts[2]);
         if (!ref) return await safeReply(ctx, "⚠️ Session expired. Paste the address again!");
-        sessions.set(telegramId, {
+        setPrompt(telegramId, {
           kind: "await_watch_alias",
           chain: ref.chain,
           address: normalizeAddress(ref.chain, ref.address)
-        });
+        }, vault);
         return await safeReply(
           ctx,
           `🏷️ Give this *${CHAINS[ref.chain].name}* wallet (\`${shortAddress(ref.address)}\`) a nickname so you remember it:${
@@ -1235,9 +1360,9 @@ export function createTelegramBot(services: BotServices): Bot {
         );
       }
 
-      // Stateless live funding alert callbacks: dg:<shortChain>:<address> / dw:<shortChain>:<address>
+      // Stateless live funding alert & detective callbacks: dg:<shortChain>:<address> / dw:<shortChain>:<address>
       if ((parts[0] === "dg" || parts[0] === "dw") && parts.length >= 3) {
-        const targetChain = SHORT_CHAIN_MAP[parts[1]];
+        const targetChain = chainFromShortCode(parts[1]);
         const addr = parts.slice(2).join(":");
         if (!targetChain || !isValidAddressFormat(targetChain, addr)) {
           return await safeReply(ctx, "❌ Invalid wallet alert payload.");
@@ -1250,11 +1375,11 @@ export function createTelegramBot(services: BotServices): Bot {
             days: 7
           });
         }
-        sessions.set(telegramId, {
+        setPrompt(telegramId, {
           kind: "await_watch_alias",
           chain: targetChain,
           address: norm
-        });
+        }, vault);
         return await safeReply(
           ctx,
           `🏷️ Give this *${CHAINS[targetChain].name}* wallet (\`${shortAddress(norm)}\`) a nickname so you remember it:`
@@ -1263,13 +1388,13 @@ export function createTelegramBot(services: BotServices): Bot {
 
       // Settings
       if (parts[0] === "set" && parts[1] === "slippage") {
-        sessions.set(telegramId, { kind: "await_slippage" });
+        setPrompt(telegramId, { kind: "await_slippage" }, vault);
         return await safeReply(ctx, "💨 Type your new max slippage % (for example: `15` for 15%):");
       }
 
       if (parts[0] === "set" && parts[1] === "fee" && isChainKey(parts[2])) {
         const chain = parts[2];
-        sessions.set(telegramId, { kind: "await_gas_fee", chain });
+        setPrompt(telegramId, { kind: "await_gas_fee", chain }, vault);
         return await safeReply(
           ctx,
           `⛽ Type your simulated network fee in *${CHAINS[chain].nativeSymbol}* (or \`0\` for zero fee):`
@@ -1329,7 +1454,7 @@ export function createTelegramBot(services: BotServices): Bot {
         if (!(await services.adminDb.isAdmin(telegramId))) return;
         if (parts[1] === "gencode") {
           const maxUses = Number(parts[2] ?? 1);
-          sessions.set(telegramId, { kind: "await_admin_code_label", maxUses });
+          setPrompt(telegramId, { kind: "await_admin_code_label", maxUses }, vault);
           return await safeReply(
             ctx,
             "🎟️ Type a quick note for who this pass is for (e.g., `Alex`), or send `skip`:"
@@ -1426,7 +1551,7 @@ export function createTelegramBot(services: BotServices): Bot {
     }
 
     const vault = await services.vaultManager.getVault(telegramId);
-    const pending = sessions.get(telegramId);
+    const pending = await getPrompt(telegramId, vault);
 
     if (!pending) {
       // Auto-detect pasted token contract address right in chat!
@@ -1445,11 +1570,11 @@ export function createTelegramBot(services: BotServices): Bot {
       switch (pending.kind) {
         case "await_set_balance": {
           const spec = CHAINS[pending.chain];
-          const atomic = parseExactUnits(text, spec.nativeDecimals);
+          const atomic = parseExactUnits(cleanDecimalInput(text), spec.nativeDecimals);
           await vault.setVirtualFunds(pending.chain, atomic, true);
           const price = await services.market.getNativePriceUsd(pending.chain).catch(() => 0);
           const usd = nativeAtomicToUsd(atomic, spec.nativeDecimals, price);
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           await safeReply(
             ctx,
             `✅ Updated *${spec.name}* balance to \`${formatExactUnits(atomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
@@ -1462,7 +1587,7 @@ export function createTelegramBot(services: BotServices): Bot {
 
         case "await_add_balance_native": {
           const spec = CHAINS[pending.chain];
-          const addAtomic = parseExactUnits(text, spec.nativeDecimals);
+          const addAtomic = parseExactUnits(cleanDecimalInput(text), spec.nativeDecimals);
           if (addAtomic <= 0n) throw new Error("Enter an amount greater than 0.");
           const [nextBal, price] = await Promise.all([
             vault.addVirtualFunds(pending.chain, addAtomic),
@@ -1470,7 +1595,7 @@ export function createTelegramBot(services: BotServices): Bot {
           ]);
           const addedUsd = nativeAtomicToUsd(addAtomic, spec.nativeDecimals, price);
           const totalUsd = nativeAtomicToUsd(nextBal, spec.nativeDecimals, price);
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           await safeReply(
             ctx,
             `✅ Added \`${formatExactUnits(addAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
@@ -1485,7 +1610,7 @@ export function createTelegramBot(services: BotServices): Bot {
 
         case "await_add_balance_usd": {
           const spec = CHAINS[pending.chain];
-          const usdVal = Number(text.replace(/[$,\s]/g, ""));
+          const usdVal = Number(cleanDecimalInput(text));
           if (!Number.isFinite(usdVal) || usdVal <= 0 || usdVal > 1_000_000_000) {
             throw new Error("Enter a valid dollar amount, like `250` or `19.50`.");
           }
@@ -1497,7 +1622,7 @@ export function createTelegramBot(services: BotServices): Bot {
           if (addAtomic <= 0n) throw new Error("Dollar amount is too small to convert.");
           const nextBal = await vault.addVirtualFunds(pending.chain, addAtomic);
           const totalUsd = nativeAtomicToUsd(nextBal, spec.nativeDecimals, price);
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           await safeReply(
             ctx,
             `✅ Added \`${formatExactUnits(addAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\` (≈ *${formatUsd(usdVal)} USDT* at *${formatUsd(price)}/${spec.nativeSymbol}*)!\nNew *${spec.name}* Balance: \`${formatExactUnits(nextBal, spec.nativeDecimals)} ${spec.nativeSymbol}\` (≈ *${formatUsd(totalUsd)} USDT*)`
@@ -1507,7 +1632,7 @@ export function createTelegramBot(services: BotServices): Bot {
         }
 
         case "await_investigate_address": {
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           if (isValidAddressFormat("solana", text)) {
             return await runAndSendWalletDetective(ctx, vault, {
               chain: "solana",
@@ -1526,15 +1651,15 @@ export function createTelegramBot(services: BotServices): Bot {
         }
 
         case "await_buy_token_ca": {
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           await scanAddressInput(ctx, telegramId, text, pending.chain);
           return;
         }
 
         case "await_custom_buy_amount": {
           const spec = CHAINS[pending.chain];
-          const atomic = parseExactUnits(text, spec.nativeDecimals);
-          sessions.clear(telegramId);
+          const atomic = parseExactUnits(cleanDecimalInput(text), spec.nativeDecimals);
+          clearPrompt(telegramId, vault);
           const res = await services.trading.executeBuy(vault, {
             chain: pending.chain,
             tokenAddress: pending.tokenAddress,
@@ -1548,12 +1673,12 @@ export function createTelegramBot(services: BotServices): Bot {
         case "await_custom_sell_amount": {
           const pos = await vault.getPositionById(pending.positionId);
           if (!pos || pos.status !== "open") {
-            sessions.clear(telegramId);
+            clearPrompt(telegramId, vault);
             return await safeReply(ctx, "❌ Position is no longer open.");
           }
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           if (text.endsWith("%")) {
-            const pct = Number(text.slice(0, -1).trim());
+            const pct = Number(text.slice(0, -1).replace(/,/g, "").trim());
             if (!Number.isFinite(pct) || pct <= 0 || pct > 100) {
               throw new Error("Percentage must be between 0.01% and 100%.");
             }
@@ -1564,7 +1689,7 @@ export function createTelegramBot(services: BotServices): Bot {
             });
             return await sendSellSuccess(ctx, res);
           }
-          const tokensAtomic = parseExactUnits(text, pos.tokenDecimals);
+          const tokensAtomic = parseExactUnits(cleanDecimalInput(text), pos.tokenDecimals);
           const res = await services.trading.executeSell(vault, {
             positionId: pos.id,
             sellTokensAtomic: tokensAtomic,
@@ -1575,12 +1700,12 @@ export function createTelegramBot(services: BotServices): Bot {
 
         case "await_limit_buy": {
           const [mcStr, amtStr] = text.split(/\s+/);
-          const targetMc = Number(mcStr);
+          const targetMc = Number((mcStr ?? "").replace(/[$,]/g, ""));
           if (!Number.isFinite(targetMc) || targetMc <= 0 || !amtStr) {
             throw new Error("Send two numbers: `<target_mc_usd> <amount>`, e.g. `50000 0.5`");
           }
           const spec = CHAINS[pending.chain];
-          const amountAtomic = parseExactUnits(amtStr, spec.nativeDecimals);
+          const amountAtomic = parseExactUnits(cleanDecimalInput(amtStr), spec.nativeDecimals);
           const snap = await services.market.getTokenSnapshot(pending.chain, pending.tokenAddress);
           const symbol = snap?.symbol ?? shortAddress(pending.tokenAddress);
           const id = await vault.createOrder({
@@ -1600,7 +1725,7 @@ export function createTelegramBot(services: BotServices): Bot {
             dcaRemaining: null,
             nextRunAt: null
           });
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           return await safeReply(
             ctx,
             `🎯 *Limit Buy #${id} Active!*\nWill buy *${formatExactUnits(amountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}* of *$${escapeMd(symbol)}* if Market Cap hits ≤ ${formatUsd(targetMc)}.`
@@ -1608,14 +1733,14 @@ export function createTelegramBot(services: BotServices): Bot {
         }
 
         case "await_dca_buy": {
-          const [amtStr, minStr, countStr] = text.split(/\s+/);
-          const intervalMin = Number(minStr);
-          const count = Math.floor(Number(countStr));
+          const [amtStr, minStr, countStr] = text.split(/[\s,]+/).filter(Boolean);
+          const intervalMin = Number((minStr ?? "").replace(/,/g, ""));
+          const count = Math.floor(Number((countStr ?? "").replace(/,/g, "")));
           if (!amtStr || !Number.isFinite(intervalMin) || intervalMin < 1 || !Number.isFinite(count) || count < 1) {
             throw new Error("Send 3 numbers: `<amount> <minutes> <count>`, e.g. `0.2 15 5`");
           }
           const spec = CHAINS[pending.chain];
-          const amountAtomic = parseExactUnits(amtStr, spec.nativeDecimals);
+          const amountAtomic = parseExactUnits(cleanDecimalInput(amtStr), spec.nativeDecimals);
           const snap = await services.market.getTokenSnapshot(pending.chain, pending.tokenAddress);
           const symbol = snap?.symbol ?? shortAddress(pending.tokenAddress);
           const id = await vault.createOrder({
@@ -1635,7 +1760,7 @@ export function createTelegramBot(services: BotServices): Bot {
             dcaRemaining: count,
             nextRunAt: Date.now()
           });
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           return await safeReply(
             ctx,
             `🔁 *DCA Order #${id} Started!*\nWill buy *${formatExactUnits(amountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}* of *$${escapeMd(symbol)}* every ${intervalMin}m (${count} times).`
@@ -1645,12 +1770,12 @@ export function createTelegramBot(services: BotServices): Bot {
         case "await_pos_order": {
           const pos = await vault.getPositionById(pending.positionId);
           if (!pos || pos.status !== "open") {
-            sessions.clear(telegramId);
+            clearPrompt(telegramId, vault);
             return await safeReply(ctx, "❌ Position is no longer open.");
           }
           const [pctStr, sellPctStr] = text.split(/\s+/);
-          const trigger = Number(pctStr);
-          const sellPct = Math.min(100, Math.max(1, Number(sellPctStr ?? 100)));
+          const trigger = Number((pctStr ?? "").replace(/[%,]/g, ""));
+          const sellPct = Math.min(100, Math.max(1, Number((sellPctStr ?? "100").replace(/[%,]/g, ""))));
           if (!Number.isFinite(trigger)) throw new Error("Enter valid numbers.");
           if (pending.orderType === "tp" && trigger <= 0) {
             throw new Error("Take-profit % should be positive (e.g. `100 50`).");
@@ -1679,7 +1804,7 @@ export function createTelegramBot(services: BotServices): Bot {
             dcaRemaining: null,
             nextRunAt: null
           });
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           return await safeReply(ctx, `✅ Auto-order saved for *$${escapeMd(pos.tokenSymbol)}*!`);
         }
 
@@ -1687,11 +1812,11 @@ export function createTelegramBot(services: BotServices): Bot {
           if (!isValidAddressFormat(pending.chain, text)) {
             throw new Error(`That doesn't look like a valid ${CHAINS[pending.chain].name} address. Try again:`);
           }
-          sessions.set(telegramId, {
+          setPrompt(telegramId, {
             kind: "await_watch_alias",
             chain: pending.chain,
             address: normalizeAddress(pending.chain, text)
-          });
+          }, vault);
           return await safeReply(
             ctx,
             "🏷️ Give this wallet a nickname so you recognize it in reports (e.g., `AlphaWhale`):"
@@ -1701,18 +1826,18 @@ export function createTelegramBot(services: BotServices): Bot {
         case "await_watch_alias": {
           const alias = text.slice(0, 32);
           const spec = CHAINS[pending.chain];
-          sessions.set(telegramId, {
+          setPrompt(telegramId, {
             kind: "await_watch_amount",
             chain: pending.chain,
             address: pending.address,
             alias
-          });
+          }, vault);
           return await safeReply(
             ctx,
             `💵 How much virtual *${spec.nativeSymbol}* should be spent each time *${escapeMd(alias)}* buys?\n\n` +
               `• Type any exact amount (e.g. \`0.25\`, \`0.0005\`, \`0.000000001\`)\n` +
               `• OR type a % of your balance (e.g. \`10%\`)\n` +
-              `• OR type \`0\` to **Watch & Alert Only** (great for storage vaults!)`
+              `• OR type \`0\` to *Watch & Alert Only* (great for storage vaults!)`
           );
         }
 
@@ -1724,12 +1849,12 @@ export function createTelegramBot(services: BotServices): Bot {
 
           if (text.endsWith("%")) {
             copyMode = "percent_balance";
-            copyPercent = Number(text.slice(0, -1).trim());
+            copyPercent = Number(text.slice(0, -1).replace(/,/g, "").trim());
             if (!Number.isFinite(copyPercent) || copyPercent <= 0 || copyPercent > 100) {
               throw new Error("Percentage must be between 0.01% and 100%.");
             }
           } else {
-            copyAmountAtomic = parseExactUnits(text, spec.nativeDecimals);
+            copyAmountAtomic = parseExactUnits(cleanDecimalInput(text), spec.nativeDecimals);
             if (copyAmountAtomic < 0n) throw new Error("Amount cannot be negative.");
           }
 
@@ -1746,7 +1871,7 @@ export function createTelegramBot(services: BotServices): Bot {
           } catch (err) {
             const msg = (err as Error).message;
             if (/unique|duplicate/i.test(msg)) {
-              sessions.clear(telegramId);
+              clearPrompt(telegramId, vault);
               return await safeReply(
                 ctx,
                 `ℹ️ You are already watching \`${shortAddress(pending.address)}\` on *${spec.name}*! Tap *Watch Wallets* in /menu to rename or edit it.`
@@ -1754,7 +1879,7 @@ export function createTelegramBot(services: BotServices): Bot {
             }
             throw err;
           }
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           await services.walletWatcher.reloadWatchers();
 
           const w = (await vault.getWatchedWallet(walletId))!;
@@ -1770,13 +1895,13 @@ export function createTelegramBot(services: BotServices): Bot {
         case "await_rename_watch": {
           const w = await vault.getWatchedWallet(pending.walletId);
           if (!w) {
-            sessions.clear(telegramId);
+            clearPrompt(telegramId, vault);
             return await safeReply(ctx, "❌ Wallet not found.");
           }
           const newAlias = text.slice(0, 32).trim();
           if (!newAlias) throw new Error("Please enter a valid name.");
           await vault.updateWatchedWallet(w.id, { alias: newAlias });
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           await services.walletWatcher.reloadWatchers();
           const updated = (await vault.getWatchedWallet(w.id))!;
           await safeReply(ctx, `✅ Renamed wallet to *${escapeMd(updated.alias)}*!`);
@@ -1790,12 +1915,12 @@ export function createTelegramBot(services: BotServices): Bot {
         case "await_edit_watch_amount": {
           const w = await vault.getWatchedWallet(pending.walletId);
           if (!w) {
-            sessions.clear(telegramId);
+            clearPrompt(telegramId, vault);
             return await safeReply(ctx, "❌ Wallet not found.");
           }
           const spec = CHAINS[w.chain];
           if (text.endsWith("%")) {
-            const pct = Number(text.slice(0, -1).trim());
+            const pct = Number(text.slice(0, -1).replace(/,/g, "").trim());
             if (!Number.isFinite(pct) || pct <= 0 || pct > 100) {
               throw new Error("Percentage must be between 0.01% and 100%.");
             }
@@ -1805,7 +1930,7 @@ export function createTelegramBot(services: BotServices): Bot {
               copyAmountAtomic: 0n
             });
           } else {
-            const amt = parseExactUnits(text, spec.nativeDecimals);
+            const amt = parseExactUnits(cleanDecimalInput(text), spec.nativeDecimals);
             if (amt < 0n) throw new Error("Amount cannot be negative.");
             await vault.updateWatchedWallet(w.id, {
               copyMode: "fixed",
@@ -1813,7 +1938,7 @@ export function createTelegramBot(services: BotServices): Bot {
               copyPercent: 0
             });
           }
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           await services.walletWatcher.reloadWatchers();
           const updated = (await vault.getWatchedWallet(w.id))!;
           return await safeReply(
@@ -1826,7 +1951,7 @@ export function createTelegramBot(services: BotServices): Bot {
         case "await_edit_watch_filter": {
           const w = await vault.getWatchedWallet(pending.walletId);
           if (!w) {
-            sessions.clear(telegramId);
+            clearPrompt(telegramId, vault);
             return await safeReply(ctx, "❌ Wallet not found.");
           }
           const isOff = text.toLowerCase() === "off";
@@ -1835,15 +1960,15 @@ export function createTelegramBot(services: BotServices): Bot {
               await vault.updateWatchedWallet(w.id, { autoTpPct: null, autoSlPct: null });
             } else {
               const [tpStr, slStr] = text.split(/\s+/);
-              const tp = Number(tpStr);
-              const sl = Number(slStr);
+              const tp = Number((tpStr ?? "").replace(/[%,]/g, ""));
+              const sl = Number((slStr ?? "").replace(/[%,]/g, ""));
               if (!Number.isFinite(tp) || tp <= 0 || !Number.isFinite(sl) || sl >= 0) {
                 throw new Error("Example format: `150 -40` (positive TP, negative SL) or `off`");
               }
               await vault.updateWatchedWallet(w.id, { autoTpPct: tp, autoSlPct: sl });
             }
           } else {
-            const val = isOff ? null : Number(text.replace(/[,$]/g, ""));
+            const val = isOff ? null : Number(cleanDecimalInput(text));
             if (!isOff && (!Number.isFinite(val) || (val as number) < 0)) {
               throw new Error("Enter a valid dollar number like `25000` or `off`.");
             }
@@ -1851,7 +1976,7 @@ export function createTelegramBot(services: BotServices): Bot {
             if (pending.field === "max_mc") await vault.updateWatchedWallet(w.id, { maxMcUsd: val });
             if (pending.field === "min_liq") await vault.updateWatchedWallet(w.id, { minLiqUsd: val });
           }
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           await services.walletWatcher.reloadWatchers();
           const updated = (await vault.getWatchedWallet(w.id))!;
           return await safeReply(
@@ -1862,12 +1987,12 @@ export function createTelegramBot(services: BotServices): Bot {
         }
 
         case "await_slippage": {
-          const pct = Number(text.replace("%", ""));
+          const pct = Number(text.replace(/[%,\s]/g, ""));
           if (!Number.isFinite(pct) || pct < 0.1 || pct > 90) {
             throw new Error("Enter a slippage % between 0.1 and 90.");
           }
           await vault.setSetting("slippage_bps", String(Math.round(pct * 100)));
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           return await safeReply(
             ctx,
             `✅ Slippage set to *${pct.toFixed(1)}%*.`,
@@ -1877,11 +2002,11 @@ export function createTelegramBot(services: BotServices): Bot {
 
         case "await_gas_fee": {
           const spec = CHAINS[pending.chain];
-          const parsed = parseExactUnits(text, spec.nativeDecimals);
+          const parsed = parseExactUnits(cleanDecimalInput(text), spec.nativeDecimals);
           const formatted = formatExactUnits(parsed, spec.nativeDecimals);
           if (pending.chain === "solana") await vault.setSetting("priority_fee_sol", formatted);
           else await vault.setSetting("evm_gas_eth", formatted);
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           return await safeReply(
             ctx,
             `✅ Simulated network fee updated to \`${formatted} ${spec.nativeSymbol}\`.`,
@@ -1896,7 +2021,7 @@ export function createTelegramBot(services: BotServices): Bot {
             label,
             maxUses: pending.maxUses
           });
-          sessions.clear(telegramId);
+          clearPrompt(telegramId, vault);
           return await safeReply(
             ctx,
             `🎟️ *Invite Code Created!*\n\nCode: \`${code.code}\`\nMax Uses: *${code.maxUses}*${

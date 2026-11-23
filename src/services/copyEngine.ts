@@ -1,3 +1,4 @@
+import { escapeMd } from "../bot/formatters.js";
 import { ChainKey, CHAINS, shortAddress } from "../chains/registry.js";
 import { IUserVault, IVaultManager, WatchedWalletRow } from "../db/types.js";
 import { formatExactUnits, formatUsd } from "../utils/amounts.js";
@@ -166,7 +167,7 @@ export class CopyEngine {
       if ((await recordSwap("skipped_risk", "Blocked by safety filter")) && ctx.notifyEnabled) {
         await this.onNotify(
           ctx.telegramId,
-          `🛡️ *Copy Skipped (Risk)*: *${ctx.wallet.alias}* bought *${ctx.symbol}* (${ctx.specBadge}), blocked due to safety warnings.`
+          `🛡️ *Copy Skipped (Risk)*: *${escapeMd(ctx.wallet.alias)}* bought *${escapeMd(ctx.symbol)}* (${ctx.specBadge}), blocked due to safety warnings.`
         );
       }
       return;
@@ -197,7 +198,7 @@ export class CopyEngine {
       if ((await recordSwap("alert_only", "Alert & investigate mode ($0 copy)")) && ctx.notifyEnabled) {
         await this.onNotify(
           ctx.telegramId,
-          `👀 *Wallet Trade Alert:* *${ctx.wallet.alias}* bought *$${ctx.symbol}* (${ctx.specBadge}) at ${formatUsd(ctx.snap.mcUsd)} MC.`
+          `👀 *Wallet Trade Alert:* *${escapeMd(ctx.wallet.alias)}* bought *$${escapeMd(ctx.symbol)}* (${ctx.specBadge}) at ${formatUsd(ctx.snap.mcUsd)} MC.`
         );
       }
       return;
@@ -219,7 +220,7 @@ export class CopyEngine {
       if ((await recordSwap("skipped_balance", "Insufficient virtual balance")) && ctx.notifyEnabled) {
         await this.onNotify(
           ctx.telegramId,
-          `⚠️ *Copy Skipped (Low Balance)*: *${ctx.wallet.alias}* bought *${ctx.symbol}* (${ctx.specBadge}), but you only have ${formatExactUnits(available, ctx.specNativeDecimals)} ${ctx.specNativeSymbol}.`
+          `⚠️ *Copy Skipped (Low Balance)*: *${escapeMd(ctx.wallet.alias)}* bought *${escapeMd(ctx.symbol)}* (${ctx.specBadge}), but you only have ${formatExactUnits(available, ctx.specNativeDecimals)} ${ctx.specNativeSymbol}.`
         );
       }
       return;
@@ -286,8 +287,8 @@ export class CopyEngine {
         await this.onNotify(
           ctx.telegramId,
           `⚡ *Instant Copy Buy!* (${ctx.specBadge})\n` +
-            `👤 Wallet: *${ctx.wallet.alias}*\n` +
-            `🪙 Token: *${res.tokenSymbol}*\n` +
+            `👤 Wallet: *${escapeMd(ctx.wallet.alias)}*\n` +
+            `🪙 Token: *${escapeMd(res.tokenSymbol)}*\n` +
             `💵 Spent: *${formatExactUnits(res.nativeAmountAtomic, ctx.specNativeDecimals)} ${ctx.specNativeSymbol}*\n` +
             `📊 Entry MC: *${formatUsd(res.mcUsd)}* | Impact: ${(res.slippageImpactBps / 100).toFixed(2)}%`,
           res
@@ -297,7 +298,7 @@ export class CopyEngine {
       if (ctx.notifyEnabled) {
         await this.onNotify(
           ctx.telegramId,
-          `⚠️ *Copy Buy Failed* (*${ctx.wallet.alias}* → *${ctx.symbol}*): ${(err as Error).message}`
+          `⚠️ *Copy Buy Failed* (*${escapeMd(ctx.wallet.alias)}* → *${escapeMd(ctx.symbol)}*): ${escapeMd((err as Error).message)}`
         );
       }
     }
@@ -377,8 +378,8 @@ export class CopyEngine {
         await this.onNotify(
           ctx.telegramId,
           `🏁 *Instant Copy Sell!* (${ctx.specBadge})\n` +
-            `👤 Wallet: *${ctx.wallet.alias}*\n` +
-            `🪙 Token: *${res.tokenSymbol}*\n` +
+            `👤 Wallet: *${escapeMd(ctx.wallet.alias)}*\n` +
+            `🪙 Token: *${escapeMd(res.tokenSymbol)}*\n` +
             `💰 Received: *${formatExactUnits(res.nativeAmountAtomic, ctx.specNativeDecimals)} ${ctx.specNativeSymbol}*\n` +
             `📈 Realized PnL: *${pnlSign}${formatUsd(res.realizedPnlUsd)}*`,
           res
@@ -388,7 +389,7 @@ export class CopyEngine {
       if (ctx.notifyEnabled) {
         await this.onNotify(
           ctx.telegramId,
-          `⚠️ *Copy Sell Failed* (*${ctx.wallet.alias}* → *${ctx.symbol}*): ${(err as Error).message}`
+          `⚠️ *Copy Sell Failed* (*${escapeMd(ctx.wallet.alias)}* → *${escapeMd(ctx.symbol)}*): ${escapeMd((err as Error).message)}`
         );
       }
     }

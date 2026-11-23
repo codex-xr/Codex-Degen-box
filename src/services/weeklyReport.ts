@@ -84,6 +84,8 @@ export class WeeklyReportService {
   private readonly market: MarketDataService;
   private readonly detective?: WalletDetectiveService;
   private timer: NodeJS.Timeout | null = null;
+  private schedulerBusy = false;
+  private readonly scheduledAttempted = new Set<string>();
   private onAutoReport?: (telegramId: string, reportText: string) => Promise<void>;
 
   constructor(params: {
@@ -116,7 +118,7 @@ export class WeeklyReportService {
   }
 
   private async checkScheduledReports(): Promise<void> {
-    if (!this.onAutoReport) return;
+    if (!this.onAutoReport || this.schedulerBusy) return;
     const now = new Date();
     if (
       now.getUTCDay() !== this.config.weeklyReportDayUtc ||
@@ -125,37 +127,53 @@ export class WeeklyReportService {
       return;
     }
 
-    const weekAgo = Date.now() - 6 * 24 * 3600_000;
-    for (const userId of await this.adminDb.listActiveUserIds()) {
-      if (!(await this.vaultManager.hasVault(userId))) continue;
-      const vault = await this.vaultManager.getVault(userId);
-      if (!(await vault.getSettings()).weeklyReportEnabled) continue;
+    this.schedulerBusy = true;
+    try {
+      const weekAgo = Date.now() - 6 * 24 * 3600_000;
+      const runWindowKey = `${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}-${now.getUTCHours()}`;
 
-      const latest = await vault.getLatestWeeklyReport();
-      if (latest && latest.createdAt >= weekAgo) continue;
+      for (const userId of await this.adminDb.listActiveUserIds()) {
+        const dedupKey = `${userId}:${runWindowKey}`;
+        if (this.scheduledAttempted.has(dedupKey)) continue;
+        if (!(await this.vaultManager.hasVault(userId))) continue;
+        const vault = await this.vaultManager.getVault(userId);
+        if (!(await vault.getSettings()).weeklyReportEnabled) continue;
 
-      try {
-        const wallets = await vault.listWatchedWallets(true);
-        if (wallets.length > 0 && this.detective) {
-          for (const w of wallets.slice(0, 6)) {
-            const perWallet = await this.generateForWatchedWallet(vault, w.id, 7);
-            if (perWallet) {
-              await this.onAutoReport(userId, perWallet.formattedText);
+        const latest = await vault.getLatestWeeklyReport();
+        if (latest && latest.createdAt >= weekAgo) continue;
+
+        this.scheduledAttempted.add(dedupKey);
+        try {
+          const wallets = await vault.listWatchedWallets(true);
+          if (wallets.length > 0 && this.detective) {
+            let sentCount = 0;
+            for (const w of wallets) {
+              try {
+                const perWallet = await this.generateForWatchedWallet(vault, w.id, 7);
+                if (perWallet) {
+                  await this.onAutoReport(userId, perWallet.formattedText);
+                  sentCount++;
+                }
+              } catch {
+                // Keep sending remaining wallets cleanly
+              }
             }
+            await vault.saveWeeklyReport({
+              periodStart: Date.now() - 7 * 86_400_000,
+              periodEnd: Date.now(),
+              summaryJson: JSON.stringify({ mode: "wallet_by_wallet", wallets: wallets.length, sent: sentCount }),
+              reportText: `Sent ${sentCount}/${wallets.length} wallet-by-wallet reports.`
+            });
+          } else {
+            const { formattedText } = await this.generateForUser(vault, 7);
+            await this.onAutoReport(userId, formattedText);
           }
-          await vault.saveWeeklyReport({
-            periodStart: Date.now() - 7 * 86_400_000,
-            periodEnd: Date.now(),
-            summaryJson: JSON.stringify({ mode: "wallet_by_wallet", wallets: wallets.length }),
-            reportText: `Sent ${Math.min(6, wallets.length)} wallet-by-wallet reports.`
-          });
-        } else {
-          const { formattedText } = await this.generateForUser(vault, 7);
-          await this.onAutoReport(userId, formattedText);
+        } catch {
+          // Recorded in scheduledAttempted for this UTC hour so transient errors don't spam every 60s
         }
-      } catch {
-        // ignore transient errors on scheduled send
       }
+    } finally {
+      this.schedulerBusy = false;
     }
   }
 
@@ -603,7 +621,7 @@ export class WeeklyReportService {
     );
     if (summary.bestTrade) {
       lines.push(
-        `🏆 Best Trade: *${summary.bestTrade.symbol}* (${CHAINS[summary.bestTrade.chain].shortBadge}) ${
+        `🏆 Best Trade: *${escMd(summary.bestTrade.symbol)}* (${CHAINS[summary.bestTrade.chain].shortBadge}) ${
           summary.bestTrade.pnlUsd >= 0 ? "+" : ""
         }${formatUsd(summary.bestTrade.pnlUsd)} (${summary.bestTrade.roiPct.toFixed(0)}%)`
       );
@@ -630,12 +648,12 @@ export class WeeklyReportService {
         const sign = w.netPnlUsd >= 0 ? "+" : "";
         const badge = CHAINS[w.chain].shortBadge;
         lines.push(
-          `${idx + 1}. *${w.alias}* (${badge}) — ${sign}${formatUsd(w.netPnlUsd)} | ${w.winRatePct.toFixed(
+          `${idx + 1}. *${escMd(w.alias)}* (${badge}) — ${sign}${formatUsd(w.netPnlUsd)} | ${w.winRatePct.toFixed(
             0
           )}% W | Copy Score: *${w.copyabilityScore}/100*`
         );
         for (const note of w.patternNotes.slice(0, 2)) {
-          lines.push(`   _${note}_`);
+          lines.push(`   _${escMd(note)}_`);
         }
       }
     }
@@ -665,13 +683,13 @@ export class WeeklyReportService {
       lines.push("");
       lines.push("💡 *Key Takeaways:*");
       for (const rec of summary.recommendations) {
-        lines.push(`• ${rec}`);
+        lines.push(`• ${escMd(rec)}`);
       }
     }
 
     if (aiInsight) {
       lines.push("");
-      lines.push(`🤖 *Coach Summary:*\n${aiInsight}`);
+      lines.push(`🤖 *Coach Summary:*\n${aiInsight.replace(/\*\*([^*]+)\*\*/g, "*$1*")}`);
     }
 
     return lines.join("\n");

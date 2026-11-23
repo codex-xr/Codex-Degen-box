@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { escapeMd, stripMdForFallback } from "../src/bot/formatters.js";
+import { buildDetectiveKeyboard, buildTokenTradeKeyboard } from "../src/bot/keyboards.js";
 import { ChainKey } from "../src/chains/registry.js";
 import { AdminDb } from "../src/db/adminDb.js";
 import { UserVaultManager } from "../src/db/userVault.js";
@@ -15,6 +17,7 @@ import { SecurityService, TokenSecurityReport } from "../src/services/security.j
 import { SolanaClientManager } from "../src/services/solanaClient.js";
 import { TradingEngine } from "../src/services/tradingEngine.js";
 import { WalletDetectiveService, WalletInvestigationReport } from "../src/services/walletDetective.js";
+import { WalletWatcherService } from "../src/services/walletWatcher.js";
 import { WeeklyReportService } from "../src/services/weeklyReport.js";
 import { formatExactUnits, parseExactUnits, usdToNativeAtomic } from "../src/utils/amounts.js";
 
@@ -132,7 +135,11 @@ test("admin invite codes, max cabal user limit, and user isolation", async () =>
     await vaults.closeAll();
     await adminDb.close();
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+    } catch {
+      // Windows Defender / SQLite WAL handle may hold temp dir briefly
+    }
   }
 });
 
@@ -208,7 +215,7 @@ test("trading engine handles exact lowest-decimal buys, partial/full sells, and 
 
     await vaults.closeAll();
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
 
@@ -310,7 +317,11 @@ test("copy engine copies buys/sells with exact wallet attribution & generates we
     await vaults.closeAll();
     await adminDb.close();
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+    } catch {
+      // Windows Defender / SQLite WAL handle may hold temp dir briefly
+    }
   }
 });
 
@@ -461,6 +472,239 @@ test("USDT conversion, Ethereum EVM chain, wallet rename, wallet-by-wallet inves
   } finally {
     await vaults.closeAll();
     await adminDb.close();
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("freezable tokens block risky copy-buys yet sell cleanly, manual vs copy bags stay isolated, and stateless buttons fit <=64B", async () => {
+  const tmp = makeTempDir("degen-bugfixes-");
+  try {
+    const config = loadConfig({ dataDir: tmp });
+    const vaults = new UserVaultManager(config.userVaultDir);
+    const evm = new EvmClientManager(config);
+    const sol = new SolanaClientManager(config);
+    const market = new MarketDataService(config, evm, sol);
+    const snap = makeFakeSnap({
+      chain: "solana",
+      address: "TokenMintFreezable1111111111111111111111111",
+      symbol: "PEPE_2",
+      priceUsd: 0.01,
+      nativePriceUsd: 100,
+      mcUsd: 100_000,
+      liquidityUsd: 80_000
+    });
+    market.getTokenSnapshot = async () => snap;
+
+    const sec = new SecurityService();
+    const freezableRisky: TokenSecurityReport = {
+      ...makeSafeSecurity("solana"),
+      address: snap.address,
+      riskLevel: "danger",
+      freezable: true,
+      isHoneypot: false,
+      warnings: ["Freeze authority enabled"]
+    };
+    sec.checkToken = async () => freezableRisky;
+
+    const trading = new TradingEngine(market, sec);
+    const notes: string[] = [];
+    const copy = new CopyEngine({
+      vaultManager: vaults,
+      market,
+      security: sec,
+      trading,
+      onNotify: async (_u, msg) => {
+        notes.push(msg);
+      }
+    });
+
+    const vault = await vaults.getVault("999");
+    await vault.setVirtualFunds("solana", parseExactUnits("10", 9));
+    await vault.setSetting("priority_fee_sol", "0");
+    await vault.setSetting("__pending_prompt", JSON.stringify({ kind: "await_slippage" }));
+    assert.equal(await vault.getSetting("__pending_prompt"), JSON.stringify({ kind: "await_slippage" }));
+
+    // 1. CopyEngine still blocks risky freezable token when blockRisky=true
+    const wid = await vault.addWatchedWallet({
+      chain: "solana",
+      address: "Trader1111111111111111111111111111111111111",
+      alias: "Whale_One*",
+      copyMode: "fixed",
+      copyAmountAtomic: parseExactUnits("1", 9),
+      blockRisky: true,
+      simMode: "ideal"
+    });
+    const watched = (await vault.getWatchedWallet(wid))!;
+    await copy.processSwapForUser("999", watched, {
+      chain: "solana",
+      walletAddress: watched.address,
+      txHash: "sig_risk_block",
+      side: "buy",
+      tokenAddress: snap.address,
+      walletNativeAmountAtomic: parseExactUnits("1", 9),
+      detectedAt: Date.now()
+    });
+    assert.equal((await vault.listOpenPositions()).length, 0);
+    // Notification escapes special characters and stripMdForFallback leaves zero backslashes
+    assert.match(notes[0] ?? "", /Whale\\_One\\\*/);
+    assert.doesNotMatch(stripMdForFallback(notes[0] ?? ""), /\\/);
+
+    // 2. Manual buy on freezable token sells cleanly at live market price (NO false $0 rug writeoff)
+    const manBuy = await trading.executeBuy(vault, {
+      chain: "solana",
+      tokenAddress: snap.address,
+      spendNativeAtomic: parseExactUnits("2", 9),
+      sourceType: "manual"
+    });
+    const manSell = await trading.executeSell(vault, {
+      positionId: manBuy.positionId,
+      sellPct: 100,
+      sourceType: "manual"
+    });
+    assert.equal(manSell.side, "sell");
+    assert.ok(manSell.nativeAmountAtomic > parseExactUnits("1.8", 9));
+
+    // 3. Copy position and manual position on SAME token stay isolated
+    sec.checkToken = async () => makeSafeSecurity("solana");
+    const copyBuy = await trading.executeBuy(vault, {
+      chain: "solana",
+      tokenAddress: snap.address,
+      spendNativeAtomic: parseExactUnits("1", 9),
+      sourceType: "copy",
+      copiedWalletId: wid
+    });
+    const secondManual = await trading.executeBuy(vault, {
+      chain: "solana",
+      tokenAddress: snap.address,
+      spendNativeAtomic: parseExactUnits("1", 9),
+      sourceType: "manual"
+    });
+    assert.notEqual(copyBuy.positionId, secondManual.positionId);
+
+    // 4. All stateless token & detective inline buttons stay <= 64 bytes even for max 44-char Solana addrs
+    const maxSol = "11111111111111111111111111111111111111111111"; // 44 chars
+    const tokKb = buildTokenTradeKeyboard("solana", maxSol, "0123456789");
+    for (const row of tokKb.inline_keyboard) {
+      for (const btn of row) {
+        if ("callback_data" in btn && btn.callback_data) {
+          assert.ok(Buffer.byteLength(btn.callback_data, "utf8") <= 64, `Too long: ${btn.callback_data}`);
+        }
+      }
+    }
+    const detKb = buildDetectiveKeyboard({
+      cardRefId: "0123456789",
+      watchRefId: "0123456789",
+      chain: "solana",
+      address: maxSol,
+      days: 30,
+      buddyRefs: [{ address: maxSol, refId: "0123456789" }]
+    });
+    for (const row of detKb.inline_keyboard) {
+      for (const btn of row) {
+        if ("callback_data" in btn && btn.callback_data) {
+          assert.ok(Buffer.byteLength(btn.callback_data, "utf8") <= 64, `Too long: ${btn.callback_data}`);
+        }
+      }
+    }
+
+    assert.equal(escapeMd("PEPE_2"), "PEPE\\_2");
+    assert.equal(stripMdForFallback("*PEPE\\_2*"), "PEPE_2");
+
+    await vaults.closeAll();
+  } finally {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+    } catch {
+      // Windows Defender / SQLite WAL handle may hold temp dir briefly
+    }
+  }
+});
+
+test("walletWatcher retries after transient RPC failures and detects coin-to-coin & unparsed SOL buys", async () => {
+  const tmp = makeTempDir("degen-watcher-");
+  try {
+    const config = loadConfig({ dataDir: tmp, heliusApiKey: "" });
+    const adminDb = new AdminDb(config.adminDbPath, 10);
+    const vaults = new UserVaultManager(config.userVaultDir);
+    const evm = new EvmClientManager(config);
+    const sol = new SolanaClientManager(config);
+    const market = new MarketDataService(config, evm, sol);
+    const sec = new SecurityService();
+    const trading = new TradingEngine(market, sec);
+    const copy = new CopyEngine({
+      vaultManager: vaults,
+      market,
+      security: sec,
+      trading,
+      onNotify: async () => {}
+    });
+
+    const watcher = new WalletWatcherService({
+      config,
+      adminDb,
+      vaultManager: vaults,
+      evmClients: evm,
+      solanaClient: sol,
+      copyEngine: copy
+    });
+
+    const dispatched: Array<{ side: string; token: string }> = [];
+    (watcher as unknown as { dispatchSwap: (s: { side: string; tokenAddress: string }) => Promise<void> }).dispatchSwap =
+      async (s) => {
+        dispatched.push({ side: s.side, token: s.tokenAddress });
+      };
+
+    // 1. Transient RPC failure returns false so tx is NOT marked permanently seen
+    const origFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response("rate limited", { status: 429 });
+    };
+    const okFirst = await watcher.handleSolanaSignature("Wallet11111111111111111111111111111111111111", "sig_retry_1");
+    assert.equal(okFirst, false);
+    assert.ok(calls >= 2);
+
+    // 2. Retry succeeds once RPC responds with a coin-to-coin swap (SoldMint -> BoughtMint)
+    const fakeParsedTx = {
+      meta: {
+        err: null,
+        preBalances: [5_000_000_000],
+        postBalances: [4_995_000_000],
+        preTokenBalances: [{ owner: "Wallet11111111111111111111111111111111111111", mint: "MintOld111", uiTokenAmount: { amount: "1000" } }],
+        postTokenBalances: [{ owner: "Wallet11111111111111111111111111111111111111", mint: "MintNew222", uiTokenAmount: { amount: "5000" } }]
+      },
+      transaction: { message: { accountKeys: ["Wallet11111111111111111111111111111111111111"] } }
+    };
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: fakeParsedTx }), { status: 200 });
+
+    const okRetry = await watcher.handleSolanaSignature("Wallet11111111111111111111111111111111111111", "sig_retry_1");
+    globalThis.fetch = origFetch;
+    assert.equal(okRetry, true);
+    assert.deepEqual(dispatched, [
+      { side: "sell", token: "MintOld111" },
+      { side: "buy", token: "MintNew222" }
+    ]);
+
+    // 3. Helius UNKNOWN router with native SOL spend + bought token still classifies as a BUY
+    const heliusSwaps = (
+      watcher as unknown as {
+        extractSwapsFromHeliusTx: (w: string, sig: string, tx: unknown) => Array<{ side: string; tokenAddress: string }>;
+      }
+    ).extractSwapsFromHeliusTx("Wallet11111111111111111111111111111111111111", "sig_helius_1", {
+      type: "UNKNOWN",
+      source: "PUMP_AMM",
+      nativeTransfers: [{ fromUserAccount: "Wallet11111111111111111111111111111111111111", toUserAccount: "PoolPDA", amount: 250_000_000 }],
+      tokenTransfers: [{ fromUserAccount: "PoolPDA", toUserAccount: "Wallet11111111111111111111111111111111111111", mint: "PumpMint999", tokenAmount: 100000 }]
+    });
+    assert.equal(heliusSwaps.length, 1);
+    assert.equal(heliusSwaps[0].side, "buy");
+    assert.equal(heliusSwaps[0].tokenAddress, "PumpMint999");
+
+    await vaults.closeAll();
+    await adminDb.close();
+  } finally {
     fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });

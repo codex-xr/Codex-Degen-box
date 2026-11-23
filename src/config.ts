@@ -65,13 +65,13 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     : "wss://api.mainnet-beta.solana.com";
   const defaultEthRpc = alchemyApiKey
     ? `https://eth-mainnet.g.alchemy.com/v2/${alchemyApiKey}`
-    : "https://ethereum-rpc.publicnode.com";
+    : "https://eth.drpc.org";
   const defaultEthWs = alchemyApiKey
     ? `wss://eth-mainnet.g.alchemy.com/v2/${alchemyApiKey}`
     : "wss://ethereum-rpc.publicnode.com";
   const defaultBaseRpc = alchemyApiKey
     ? `https://base-mainnet.g.alchemy.com/v2/${alchemyApiKey}`
-    : "https://mainnet.base.org";
+    : "https://base.drpc.org";
   const defaultBaseWs = alchemyApiKey
     ? `wss://base-mainnet.g.alchemy.com/v2/${alchemyApiKey}`
     : "wss://base-rpc.publicnode.com";

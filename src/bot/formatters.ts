@@ -20,6 +20,28 @@ export function escapeMd(text: string): string {
   return text.replace(/([_*`\[])/g, "\\$1");
 }
 
+export function stripMdForFallback(text: string): string {
+  return text.replace(/\\([_*`\[\\])|[*_`]/g, (_match, escaped?: string) => escaped ?? "");
+}
+
+const SHORT_TO_CHAIN: Record<string, ChainKey> = {
+  s: "solana",
+  e: "ethereum",
+  b: "base",
+  r: "robinhood"
+};
+
+export function shortChainCode(chain: ChainKey): string {
+  if (chain === "solana") return "s";
+  if (chain === "ethereum") return "e";
+  if (chain === "base") return "b";
+  return "r";
+}
+
+export function chainFromShortCode(code: string | undefined): ChainKey | null {
+  return code ? (SHORT_TO_CHAIN[code] ?? null) : null;
+}
+
 export async function formatHomeMessage(vault: IUserVault, isAdmin: boolean): Promise<string> {
   const [balances, settings, openPositions, activeOrders, watchers] = await Promise.all([
     vault.getBalances(),

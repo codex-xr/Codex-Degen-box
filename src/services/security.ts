@@ -188,7 +188,8 @@ export class SecurityService {
           }
           if (freezeAuth?.status === "1") {
             freezable = true;
-            isHoneypot = true;
+            // Freeze authority makes a token high-risk for copy-filtering (riskLevel="danger"),
+            // but does NOT mean the token is already rugged/unsellable when liquidity is live.
             if (!warnings.some((w) => w.toLowerCase().includes("freeze"))) {
               warnings.push("Freeze authority enabled");
             }

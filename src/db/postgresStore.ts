@@ -741,6 +741,15 @@ export class PostgresUserVault implements IUserVault {
     };
   }
 
+  async getSetting(key: string): Promise<string | null> {
+    const res = await runQuery(
+      this.pool,
+      `SELECT value FROM ${this.t("user_settings")} WHERE key = $1`,
+      [key]
+    );
+    return res.rows[0]?.value !== undefined ? String(res.rows[0].value) : null;
+  }
+
   async setSetting(key: string, value: string): Promise<void> {
     await runQuery(
       this.pool,
@@ -757,21 +766,29 @@ export class PostgresUserVault implements IUserVault {
   ): Promise<PositionRow | null> {
     const norm = normalizeAddress(chain, tokenAddress);
     const res =
-      copiedWalletId !== undefined && copiedWalletId !== null
+      copiedWalletId === null
         ? await runQuery(
             this.pool,
             `SELECT * FROM ${this.t("positions")}
-             WHERE status = 'open' AND chain = $1 AND token_address = $2 AND copied_wallet_id = $3
-             ORDER BY id DESC LIMIT 1`,
-            [chain, norm, copiedWalletId]
-          )
-        : await runQuery(
-            this.pool,
-            `SELECT * FROM ${this.t("positions")}
-             WHERE status = 'open' AND chain = $1 AND token_address = $2
+             WHERE status = 'open' AND chain = $1 AND token_address = $2 AND copied_wallet_id IS NULL
              ORDER BY id DESC LIMIT 1`,
             [chain, norm]
-          );
+          )
+        : copiedWalletId !== undefined
+          ? await runQuery(
+              this.pool,
+              `SELECT * FROM ${this.t("positions")}
+               WHERE status = 'open' AND chain = $1 AND token_address = $2 AND copied_wallet_id = $3
+               ORDER BY id DESC LIMIT 1`,
+              [chain, norm, copiedWalletId]
+            )
+          : await runQuery(
+              this.pool,
+              `SELECT * FROM ${this.t("positions")}
+               WHERE status = 'open' AND chain = $1 AND token_address = $2
+               ORDER BY id DESC LIMIT 1`,
+              [chain, norm]
+            );
     return res.rows[0] ? this.mapPosition(res.rows[0]) : null;
   }
 

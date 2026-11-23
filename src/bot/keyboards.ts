@@ -1,7 +1,11 @@
 import { InlineKeyboard } from "grammy";
 import { CHAIN_LIST, ChainKey, CHAINS, EVM_CHAIN_KEYS, shortAddress } from "../chains/registry.js";
 import { PnlTheme, PositionRow, UserSettings, WatchedWalletRow } from "../db/userVault.js";
-import { formatShortTokenLabel } from "./formatters.js";
+import { formatShortTokenLabel, shortChainCode } from "./formatters.js";
+
+function packCallback(stateless: string, legacyFallback: string): string {
+  return Buffer.byteLength(stateless, "utf8") <= 64 ? stateless : legacyFallback;
+}
 
 export type TokenRefResolver = (chain: ChainKey, address: string) => string;
 
@@ -63,34 +67,37 @@ export function buildTokenTradeKeyboard(
   refId: string
 ): InlineKeyboard {
   const spec = CHAINS[chain];
+  const sc = shortChainCode(chain);
   const kb = new InlineKeyboard();
   for (const amt of spec.defaultBuyPresets) {
-    kb.text(`Buy ${amt} ${spec.nativeSymbol}`, `buy:${refId}:${amt}`);
+    kb.text(`Buy ${amt} ${spec.nativeSymbol}`, packCallback(`b:${sc}:${tokenAddress}:${amt}`, `buy:${refId}:${amt}`));
   }
   kb.row()
-    .text(`✏️ Buy Custom ${spec.nativeSymbol}`, `buycustom:${refId}`)
-    .text("🎯 Limit Buy", `limitbuy:${refId}`)
+    .text(`✏️ Buy Custom ${spec.nativeSymbol}`, packCallback(`bc:${sc}:${tokenAddress}`, `buycustom:${refId}`))
+    .text("🎯 Limit Buy", packCallback(`lb:${sc}:${tokenAddress}`, `limitbuy:${refId}`))
     .row()
-    .text("🔁 DCA Buy", `dcabuy:${refId}`)
-    .text("🔄 Refresh", `refreshscan:${refId}`)
+    .text("🔁 DCA Buy", packCallback(`db:${sc}:${tokenAddress}`, `dcabuy:${refId}`))
+    .text("🔄 Refresh", packCallback(`rf:${sc}:${tokenAddress}`, `refreshscan:${refId}`))
     .row()
     .text("📈 Positions", "nav:positions")
     .text("🏠 Home", "nav:home");
 
-  void tokenAddress;
   return kb;
 }
 
 export function buildDisambiguateChainKeyboard(
   chains: ChainKey[],
-  refByChain: Map<ChainKey, string>
+  refByChain: Map<ChainKey, string>,
+  address?: string
 ): InlineKeyboard {
   const kb = new InlineKeyboard();
   for (const c of chains) {
     const spec = CHAINS[c];
     const refId = refByChain.get(c);
-    if (refId) {
-      kb.text(`${spec.emoji} ${spec.name}`, `refreshscan:${refId}`);
+    const stateless = address ? `rf:${shortChainCode(c)}:${address}` : "";
+    const cb = stateless && Buffer.byteLength(stateless, "utf8") <= 64 ? stateless : refId ? `refreshscan:${refId}` : "";
+    if (cb) {
+      kb.text(`${spec.emoji} ${spec.name}`, cb);
     }
   }
   kb.row().text("🏠 Main Menu", "nav:home");
@@ -200,22 +207,36 @@ export function buildReportKeyboard(wallets: WatchedWalletRow[] = []): InlineKey
 
 export function buildWalletReportKeyboard(params: {
   walletId: number;
+  chain?: ChainKey;
+  address?: string;
   days: number;
   cardRefId: string;
   buddyRefs: Array<{ address: string; roleBadge: string; refId: string }>;
 }): InlineKeyboard {
+  const sc = params.chain ? shortChainCode(params.chain) : "";
   const kb = new InlineKeyboard()
     .text(params.days === 1 ? "• 24h •" : "⚡ 24h", `report:wallet:${params.walletId}:1`)
     .text(params.days === 7 ? "• 7d •" : "📅 7d", `report:wallet:${params.walletId}:7`)
     .text(params.days === 30 ? "• 30d •" : "📆 30d", `report:wallet:${params.walletId}:30`)
     .row()
-    .text("🖼️ Detective Card (PNG)", `det:card:${params.cardRefId}`)
+    .text(
+      "🖼️ Detective Card (PNG)",
+      sc && params.address
+        ? packCallback(`dc:${sc}:${params.address}`, `det:card:${params.cardRefId}`)
+        : `det:card:${params.cardRefId}`
+    )
     .row();
 
   for (const b of params.buddyRefs.slice(0, 3)) {
     const short = shortAddress(b.address, 4, 4);
-    kb.text(`🔍 Check ${short}`, `det:go:${b.refId}`)
-      .text(`👁️ Watch ${short}`, `det:watch:${b.refId}`)
+    kb.text(
+      `🔍 Check ${short}`,
+      sc ? packCallback(`dg:${sc}:${b.address}`, `det:go:${b.refId}`) : `det:go:${b.refId}`
+    )
+      .text(
+        `👁️ Watch ${short}`,
+        sc ? packCallback(`dw:${sc}:${b.address}`, `det:watch:${b.refId}`) : `det:watch:${b.refId}`
+      )
       .row();
   }
 
@@ -231,27 +252,37 @@ export function buildDetectiveKeyboard(params: {
   days: number;
   buddyRefs: Array<{ address: string; refId: string }>;
 }): InlineKeyboard {
+  const sc = shortChainCode(params.chain);
   const kb = new InlineKeyboard()
-    .text("🖼️ Detective Card (PNG)", `det:card:${params.cardRefId}`)
-    .text("👁️ Watch This Wallet", `det:watch:${params.watchRefId}`)
+    .text("🖼️ Detective Card (PNG)", packCallback(`dc:${sc}:${params.address}`, `det:card:${params.cardRefId}`))
+    .text("👁️ Watch This Wallet", packCallback(`dw:${sc}:${params.address}`, `det:watch:${params.watchRefId}`))
     .row()
-    .text(params.days === 1 ? "• 24h •" : "⚡ 24h", `det:days:${params.cardRefId}:1`)
-    .text(params.days === 7 ? "• 7d •" : "📅 7d", `det:days:${params.cardRefId}:7`)
-    .text(params.days === 30 ? "• 30d •" : "📆 30d", `det:days:${params.cardRefId}:30`)
+    .text(
+      params.days === 1 ? "• 24h •" : "⚡ 24h",
+      packCallback(`dd:${sc}:${params.address}:1`, `det:days:${params.cardRefId}:1`)
+    )
+    .text(
+      params.days === 7 ? "• 7d •" : "📅 7d",
+      packCallback(`dd:${sc}:${params.address}:7`, `det:days:${params.cardRefId}:7`)
+    )
+    .text(
+      params.days === 30 ? "• 30d •" : "📆 30d",
+      packCallback(`dd:${sc}:${params.address}:30`, `det:days:${params.cardRefId}:30`)
+    )
     .row();
 
   if (CHAINS[params.chain].vm === "evm") {
     for (const c of EVM_CHAIN_KEYS) {
       const label = c === params.chain ? `• ${CHAINS[c].shortBadge} •` : `${CHAINS[c].emoji} ${CHAINS[c].shortBadge}`;
-      kb.text(label, `det:evm:${params.cardRefId}:${c}`);
+      kb.text(label, packCallback(`de:${sc}:${params.address}:${shortChainCode(c)}`, `det:evm:${params.cardRefId}:${c}`));
     }
     kb.row();
   }
 
   for (const b of params.buddyRefs.slice(0, 3)) {
     const short = shortAddress(b.address, 4, 4);
-    kb.text(`🔍 ${short}`, `det:go:${b.refId}`)
-      .text(`👁️ Watch ${short}`, `det:watch:${b.refId}`)
+    kb.text(`🔍 ${short}`, packCallback(`dg:${sc}:${b.address}`, `det:go:${b.refId}`))
+      .text(`👁️ Watch ${short}`, packCallback(`dw:${sc}:${b.address}`, `det:watch:${b.refId}`))
       .row();
   }
 

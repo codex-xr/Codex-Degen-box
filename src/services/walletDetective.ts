@@ -1,9 +1,34 @@
+import { erc20Abi, parseAbiItem } from "viem";
 import { ChainKey, CHAINS, EvmChainKey, normalizeAddress, shortAddress } from "../chains/registry.js";
 import { AppConfig } from "../config.js";
 import { atomicToNumber, formatExactUnits } from "../utils/amounts.js";
 import { EvmClientManager } from "./evmClients.js";
 import { MarketDataService } from "./marketData.js";
 import { SolanaClientManager } from "./solanaClient.js";
+
+const EVM_TRANSFER_EVENT = parseAbiItem(
+  "event Transfer(address indexed from, address indexed to, uint256 value)"
+);
+
+function parseTokenDecimals(raw: unknown): number {
+  if (raw === null || raw === undefined || String(raw).trim() === "") return 18;
+  const num = Number(raw);
+  return Number.isInteger(num) && num >= 0 && num <= 36 ? num : 18;
+}
+
+function extractTxAccountKeys(tx: {
+  meta?: { loadedAddresses?: { writable?: string[]; readonly?: string[] } } | null;
+  transaction?: { message?: { accountKeys?: Array<string | { pubkey: string }> } };
+}): string[] {
+  const staticKeys = (tx.transaction?.message?.accountKeys ?? []).map((k) =>
+    typeof k === "string" ? k : k.pubkey
+  );
+  return [
+    ...staticKeys,
+    ...(tx.meta?.loadedAddresses?.writable ?? []),
+    ...(tx.meta?.loadedAddresses?.readonly ?? [])
+  ].filter(Boolean);
+}
 
 export interface IdentityInfo {
   domains: string[];
@@ -564,14 +589,7 @@ export class WalletDetectiveService {
         const tsMs = tx.blockTime ? tx.blockTime * 1000 : null;
         if (tsMs) hourCounts[new Date(tsMs).getUTCHours()] += 1;
 
-        const staticKeys = (tx.transaction?.message?.accountKeys ?? []).map((k) =>
-          typeof k === "string" ? k : k.pubkey
-        );
-        const accountKeys = [
-          ...staticKeys,
-          ...(tx.meta?.loadedAddresses?.writable ?? []),
-          ...(tx.meta?.loadedAddresses?.readonly ?? [])
-        ];
+        const accountKeys = extractTxAccountKeys(tx);
         const usesDex = accountKeys.some((k) => SOL_DEX_PROGRAMS.has(k));
         if (usesDex) swapsCount += 1;
         else transfersCount += 1;
@@ -655,9 +673,7 @@ export class WalletDetectiveService {
       if (oldestSig && oldestSig.err === null) {
         const [oldestTx] = await this.fetchSolanaTransactionsBatch([oldestSig.signature]);
         if (oldestTx && !oldestTx.meta?.err) {
-          const keys = (oldestTx.transaction?.message?.accountKeys ?? []).map((k) =>
-            typeof k === "string" ? k : k.pubkey
-          );
+          const keys = extractTxAccountKeys(oldestTx);
           const preB = oldestTx.meta?.preBalances ?? [];
           const postB = oldestTx.meta?.postBalances ?? [];
           const mainIdx = keys.indexOf(address);
@@ -827,9 +843,7 @@ export class WalletDetectiveService {
         const txs = await this.fetchSolanaTransactionsBatch(sampleSigs);
         for (const tx of txs) {
           if (!tx || tx.meta?.err) continue;
-          const keys = (tx.transaction?.message?.accountKeys ?? []).map((k) =>
-            typeof k === "string" ? k : k.pubkey
-          );
+          const keys = extractTxAccountKeys(tx);
           const usesDex = keys.some((k) => SOL_DEX_PROGRAMS.has(k));
           if (usesDex) {
             swaps += 1;
@@ -976,7 +990,7 @@ export class WalletDetectiveService {
         params: [sig, { encoding: "jsonParsed", maxSupportedTransactionVersion: 1 }]
       }));
 
-      let batchOk = false;
+      const batchMap = new Map<number, unknown>();
       try {
         const res = await fetch(this.config.solanaRpcUrl, {
           method: "POST",
@@ -986,27 +1000,29 @@ export class WalletDetectiveService {
         });
         if (res.ok) {
           const json = (await res.json()) as Array<{ id?: number; result?: unknown; error?: unknown }>;
-          if (Array.isArray(json) && json.some((item) => item.result !== undefined && item.result !== null)) {
-            json.sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
-            for (const item of json) results.push(item.result ?? null);
-            batchOk = true;
+          if (Array.isArray(json)) {
+            for (const item of json) {
+              if (typeof item.id === "number" && item.result !== undefined && item.result !== null && !item.error) {
+                batchMap.set(item.id, item.result);
+              }
+            }
           }
         }
       } catch {
-        // Fall through to single-call publicnode fallback
+        // Fall through to single-call fallback for missing items
       }
 
-      if (!batchOk) {
-        const singles = await Promise.all(
-          chunk.map((sig) =>
-            this.solanaRpcSingle("getTransaction", [
-              sig,
-              { encoding: "jsonParsed", maxSupportedTransactionVersion: 1 }
-            ])
-          )
-        );
-        results.push(...singles);
-      }
+      const chunkResults = await Promise.all(
+        chunk.map((sig, idx) => {
+          const hit = batchMap.get(idx + 1);
+          if (hit !== undefined) return Promise.resolve(hit);
+          return this.solanaRpcSingle("getTransaction", [
+            sig,
+            { encoding: "jsonParsed", maxSupportedTransactionVersion: 1 }
+          ]);
+        })
+      );
+      results.push(...chunkResults);
       if (i + batchSize < signatures.length) {
         await sleep(160);
       }
@@ -1044,33 +1060,38 @@ export class WalletDetectiveService {
 
   private async investigateEvm(
     chain: EvmChainKey,
-    address: string,
+    rawAddress: string,
     days: number
   ): Promise<WalletInvestigationReport> {
+    const address = rawAddress.toLowerCase();
     const notes: string[] = [];
     const now = Date.now();
     const cutoffMs = now - days * 86_400_000;
     const bs = BLOCKSCOUT_HOSTS[chain];
 
-    const [ethPriceUsd, rpcBal, identity, bsProfile, bsTxs, bsTokenTransfers, bsTokens] =
+    const [ethPriceUsd, rpcBal, identity, bsProfileRes, bsTxsRes, bsTokenTransfersRes, bsTokensRes] =
       await Promise.all([
         this.market.getNativePriceUsd(chain),
         this.evmClients.getNativeBalance(chain, address),
         this.lookupIdentity(chain, address),
-        this.fetchBlockscoutJson<{
+        this.fetchBlockscoutDetailed<{
           coin_balance?: string;
           ens_domain_name?: string | null;
         }>(`${bs.host}/api/v2/addresses/${address}`),
-        this.fetchBlockscoutJson<{ items?: BlockscoutTxItem[] }>(
+        this.fetchBlockscoutDetailed<{ items?: BlockscoutTxItem[] }>(
           `${bs.host}/api/v2/addresses/${address}/transactions`
         ),
-        this.fetchBlockscoutJson<{ items?: BlockscoutTokenTransferItem[] }>(
+        this.fetchBlockscoutDetailed<{ items?: BlockscoutTokenTransferItem[] }>(
           `${bs.host}/api/v2/addresses/${address}/token-transfers`
         ),
-        this.fetchBlockscoutJson<BlockscoutTokenBalanceItem[]>(
+        this.fetchBlockscoutDetailed<BlockscoutTokenBalanceItem[]>(
           `${bs.host}/api/v2/addresses/${address}/token-balances`
         )
       ]);
+    const bsProfile = bsProfileRes.data;
+    const bsTxs = bsTxsRes.data;
+    const bsTokenTransfers = bsTokenTransfersRes.data;
+    const bsTokens = bsTokensRes.data;
 
     if (bsProfile?.ens_domain_name && !identity.domains.includes(bsProfile.ens_domain_name)) {
       identity.domains.push(bsProfile.ens_domain_name);
@@ -1090,9 +1111,9 @@ export class WalletDetectiveService {
       for (const tb of bsTokens) {
         const sym = tb.token?.symbol;
         const addr = tb.token?.address_hash ?? "";
-        const dec = Number(tb.token?.decimals ?? 18);
+        const dec = parseTokenDecimals(tb.token?.decimals);
         if (!sym || !tb.value) continue;
-        const amt = atomicToNumber(BigInt(tb.value), Number.isFinite(dec) ? dec : 18);
+        const amt = atomicToNumber(BigInt(tb.value), dec);
         if (amt <= 0) continue;
         const usd = amt * Number(tb.token?.exchange_rate ?? 0);
         holdings.push({
@@ -1163,8 +1184,8 @@ export class WalletDetectiveService {
     };
 
     const items = bsTxs?.items ?? [];
-    if (items.length > 0) {
-      if (items[0].timestamp) lastActiveAtMs = Date.parse(items[0].timestamp);
+    if (bsTxs) {
+      if (items[0]?.timestamp) lastActiveAtMs = Date.parse(items[0].timestamp);
 
       for (const tx of items) {
         const tsMs = tx.timestamp ? Date.parse(tx.timestamp) : null;
@@ -1261,9 +1282,24 @@ export class WalletDetectiveService {
         recordCounter(c.address, null, false, c.inEth, c.outEth, c.tokenMoves > 0, c.lastMs);
       }
       if (alch.note) notes.push(alch.note);
-    } else if (!bsTxs && chain === "base") {
+    } else {
+      // Fallback: scan recent ERC-20 logs & total tx count directly via RPC when explorer blocks requests
+      const rpcScan = await this.scanRecentEvmActivityViaRpc(chain, address);
+      activityCount = rpcScan.activityCount;
+      swapsCount = rpcScan.swapsCount;
+      transfersCount = rpcScan.transfersCount;
+      lastActiveAtMs = rpcScan.lastActiveAtMs;
+      for (const lc of rpcScan.launchedCoins) launchedCoins.push(lc);
+      for (const c of rpcScan.counterparties) {
+        recordCounter(c.address, null, false, c.inEth, c.outEth, c.tokenMoves > 0, c.lastMs);
+      }
+      const blockedReason = bsTxsRes.status === 403 ? "blocked automated lookups" : "is unreachable right now";
       notes.push(
-        "Base public history server is offline right now (balance, .base.eth & Twitter still checked!). Cross-chain activity on Ethereum/Robinhood is shown below."
+        `${CHAINS[chain].name} explorer ${blockedReason} (${
+          rpcScan.totalTxNonce > 0
+            ? `${rpcScan.totalTxNonce} total outgoing txs confirmed on-chain; scanned latest ${rpcScan.blocksScanned} blocks`
+            : "showing live on-chain balance + identity"
+        }).`
       );
     }
 
@@ -1388,21 +1424,21 @@ export class WalletDetectiveService {
       if (Array.isArray(bsToks) && bsToks.length > 0) {
         const sorted = [...bsToks].sort((a, b) => {
           const va =
-            atomicToNumber(BigInt(a.value || "0"), Number(a.token?.decimals ?? 18)) *
+            atomicToNumber(BigInt(a.value || "0"), parseTokenDecimals(a.token?.decimals)) *
             Number(a.token?.exchange_rate ?? 0);
           const vb =
-            atomicToNumber(BigInt(b.value || "0"), Number(b.token?.decimals ?? 18)) *
+            atomicToNumber(BigInt(b.value || "0"), parseTokenDecimals(b.token?.decimals)) *
             Number(b.token?.exchange_rate ?? 0);
           return vb - va;
         });
         for (const t of sorted) {
           tokenUsdSum +=
-            atomicToNumber(BigInt(t.value || "0"), Number(t.token?.decimals ?? 18)) *
+            atomicToNumber(BigInt(t.value || "0"), parseTokenDecimals(t.token?.decimals)) *
             Number(t.token?.exchange_rate ?? 0);
         }
         const top = sorted[0];
         if (top?.token?.symbol && top.value) {
-          const amt = atomicToNumber(BigInt(top.value), Number(top.token.decimals ?? 18));
+          const amt = atomicToNumber(BigInt(top.value), parseTokenDecimals(top.token.decimals));
           buddy.topHolding = `$${top.token.symbol} (${amt >= 100 ? Math.round(amt) : amt.toPrecision(3)})`;
         }
       }
@@ -1498,12 +1534,22 @@ export class WalletDetectiveService {
           )
         ]);
         let balNative = addrJson?.coin_balance ? atomicToNumber(BigInt(addrJson.coin_balance), 18) : 0;
-        if (!addrJson && (key === "ethereum" || key === "base" || key === "robinhood")) {
-          const rpcBal = await this.evmClients.getNativeBalance(key as EvmChainKey, address);
-          if (rpcBal !== null) balNative = atomicToNumber(rpcBal, 18);
+        let txCount = txJson?.items?.length ?? 0;
+        if (key === "ethereum" || key === "base" || key === "robinhood") {
+          const evmKey = key as EvmChainKey;
+          if (!addrJson) {
+            const rpcBal = await this.evmClients.getNativeBalance(evmKey, address);
+            if (rpcBal !== null) balNative = atomicToNumber(rpcBal, 18);
+          }
+          if (!txJson) {
+            const nonce = await this.evmClients
+              .getClient(evmKey)
+              .getTransactionCount({ address: address as `0x${string}` })
+              .catch(() => 0);
+            txCount = Math.max(txCount, nonce);
+          }
         }
         const rate = key === "polygon" ? Number(addrJson?.exchange_rate ?? 0) : ethUsd;
-        const txCount = txJson?.items?.length ?? 0;
         return {
           chainKey: key,
           chainLabel: meta.label,
@@ -1524,13 +1570,175 @@ export class WalletDetectiveService {
   }
 
   private async fetchBlockscoutJson<T>(url: string): Promise<T | null> {
+    const res = await this.fetchBlockscoutDetailed<T>(url);
+    return res.data;
+  }
+
+  private async fetchBlockscoutDetailed<T>(
+    url: string
+  ): Promise<{ status: number; data: T | null }> {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(6500) });
-      if (!res.ok) return null;
-      return (await res.json()) as T;
+      const res = await fetch(url, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(6500)
+      });
+      if (!res.ok) return { status: res.status, data: null };
+      return { status: res.status, data: (await res.json()) as T };
     } catch {
-      return null;
+      return { status: 0, data: null };
     }
+  }
+
+  private async scanRecentEvmActivityViaRpc(
+    chain: EvmChainKey,
+    address: string
+  ): Promise<{
+    totalTxNonce: number;
+    blocksScanned: number;
+    activityCount: number;
+    swapsCount: number;
+    transfersCount: number;
+    lastActiveAtMs: number | null;
+    launchedCoins: LaunchedCoinInfo[];
+    counterparties: Array<{
+      address: string;
+      inEth: number;
+      outEth: number;
+      tokenMoves: number;
+      lastMs: number | null;
+    }>;
+  }> {
+    const client = this.evmClients.getClient(chain);
+    const map = new Map<
+      string,
+      { inEth: number; outEth: number; tokenMoves: number; lastMs: number | null }
+    >();
+    const launchedCoins: LaunchedCoinInfo[] = [];
+
+    let totalTxNonce = 0;
+    let latestBlock = 0n;
+    try {
+      const [nonce, blk] = await Promise.all([
+        client.getTransactionCount({ address: address as `0x${string}` }).catch(() => 0),
+        client.getBlockNumber()
+      ]);
+      totalTxNonce = nonce;
+      latestBlock = blk;
+    } catch {
+      return {
+        totalTxNonce: 0,
+        blocksScanned: 0,
+        activityCount: 0,
+        swapsCount: 0,
+        transfersCount: 0,
+        lastActiveAtMs: null,
+        launchedCoins: [],
+        counterparties: []
+      };
+    }
+
+    const chunkSize = chain === "robinhood" ? 450n : 90n;
+    const chunksCount = chain === "robinhood" ? 2 : 4;
+    const ranges: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+    let end = latestBlock;
+    for (let i = 0; i < chunksCount && end > 0n; i++) {
+      const start = end > chunkSize ? end - chunkSize + 1n : 1n;
+      ranges.push({ fromBlock: start, toBlock: end });
+      if (start <= 1n) break;
+      end = start - 1n;
+    }
+
+    const txHashes = new Set<string>();
+    let blocksScanned = 0;
+    await Promise.all(
+      ranges.map(async (r) => {
+        try {
+          const [inLogs, outLogs] = await Promise.all([
+            client.getLogs({
+              event: EVM_TRANSFER_EVENT,
+              args: { to: address as `0x${string}` },
+              fromBlock: r.fromBlock,
+              toBlock: r.toBlock
+            }),
+            client.getLogs({
+              event: EVM_TRANSFER_EVENT,
+              args: { from: address as `0x${string}` },
+              fromBlock: r.fromBlock,
+              toBlock: r.toBlock
+            })
+          ]);
+          blocksScanned += Number(r.toBlock - r.fromBlock + 1n);
+          for (const log of [...inLogs, ...outLogs]) {
+            if (log.transactionHash) txHashes.add(log.transactionHash);
+            const from = log.args.from?.toLowerCase() ?? "";
+            const to = log.args.to?.toLowerCase() ?? "";
+            const other = from === address ? to : from;
+            if (!other || other === address || other === "0x0000000000000000000000000000000000000000") continue;
+            const cur = map.get(other) ?? { inEth: 0, outEth: 0, tokenMoves: 0, lastMs: null };
+            cur.tokenMoves += 1;
+            map.set(other, cur);
+          }
+        } catch {
+          // Ignore single chunk failure
+        }
+      })
+    );
+
+    let swapsCount = 0;
+    let transfersCount = 0;
+    let lastActiveAtMs: number | null = null;
+    for (const hash of [...txHashes].slice(0, 10)) {
+      try {
+        const [tx, receipt] = await Promise.all([
+          client.getTransaction({ hash: hash as `0x${string}` }),
+          client.getTransactionReceipt({ hash: hash as `0x${string}` })
+        ]);
+        if (!lastActiveAtMs && receipt.blockNumber) {
+          const blk = await client.getBlock({ blockNumber: receipt.blockNumber }).catch(() => null);
+          if (blk?.timestamp) lastActiveAtMs = Number(blk.timestamp) * 1000;
+        }
+        const isSwap = Boolean(tx.to && tx.input && tx.input.length > 10);
+        if (isSwap) swapsCount += 1;
+        else transfersCount += 1;
+
+        if (!tx.to && receipt.contractAddress) {
+          let name = "Smart Contract / Token";
+          let symbol = "CA";
+          try {
+            const [s, n] = await Promise.all([
+              client.readContract({ address: receipt.contractAddress, abi: erc20Abi, functionName: "symbol" }),
+              client.readContract({ address: receipt.contractAddress, abi: erc20Abi, functionName: "name" })
+            ]);
+            symbol = String(s || "CA");
+            name = String(n || symbol);
+          } catch {
+            // Non-ERC20 contract
+          }
+          launchedCoins.push({
+            name,
+            symbol,
+            address: receipt.contractAddress.toLowerCase(),
+            mcUsd: 0,
+            graduated: false,
+            twitter: null,
+            createdAtMs: null
+          });
+        }
+      } catch {
+        // Ignore single tx lookup failure
+      }
+    }
+
+    return {
+      totalTxNonce,
+      blocksScanned,
+      activityCount: txHashes.size > 0 ? txHashes.size : totalTxNonce,
+      swapsCount,
+      transfersCount,
+      lastActiveAtMs,
+      launchedCoins,
+      counterparties: [...map.entries()].map(([addr, st]) => ({ address: addr, ...st }))
+    };
   }
 
   private async fetchAlchemyBaseTransfers(

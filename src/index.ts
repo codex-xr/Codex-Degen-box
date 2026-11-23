@@ -9,6 +9,7 @@ import {
   PostgresVaultManager
 } from "./db/postgresStore.js";
 import { IAdminDb, IVaultManager } from "./db/types.js";
+import { escapeMd, stripMdForFallback } from "./bot/formatters.js";
 import { createTelegramBot, shortChainCode } from "./bot/telegramBot.js";
 import { CopyEngine } from "./services/copyEngine.js";
 import { EvmClientManager } from "./services/evmClients.js";
@@ -86,7 +87,9 @@ async function main(): Promise<void> {
         });
       } catch {
         await botInstance.api
-          .sendMessage(telegramId, chunk.replace(/[*_`]/g, ""))
+          .sendMessage(telegramId, stripMdForFallback(chunk), {
+            link_preview_options: { is_disabled: true }
+          })
           .catch(() => {});
       }
     }
@@ -116,7 +119,8 @@ async function main(): Promise<void> {
           holdDurationMs: (pos.closedAt ?? Date.now()) - pos.openedAt,
           statusLabel: pos.status.toUpperCase()
         });
-        await botInstance.api.sendPhoto(telegramId, new InputFile(png, `pnl-${pos.tokenSymbol}.png`), {
+        const safeFileSym = pos.tokenSymbol.replace(/[^a-zA-Z0-9_-]/g, "_") || "token";
+        await botInstance.api.sendPhoto(telegramId, new InputFile(png, `pnl-${safeFileSym}.png`), {
           caption: `🖼️ $${pos.tokenSymbol} • ${roiPct >= 0 ? "+" : ""}${roiPct.toFixed(1)}% (${
             totalPnlUsd >= 0 ? "+" : ""
           }${formatUsd(totalPnlUsd)})`
@@ -148,7 +152,7 @@ async function main(): Promise<void> {
       const sc = shortChainCode(transfer.chain);
       const arrow = transfer.direction === "out" ? "➡️ Sent" : "⬅️ Received";
       const msg =
-        `🚨 *Wallet Movement Alert — ${wallet.alias.replace(/([_*`\[])/g, "\\$1")}* (${spec.shortBadge})\n\n` +
+        `🚨 *Wallet Movement Alert — ${escapeMd(wallet.alias)}* (${spec.shortBadge})\n\n` +
         `${arrow} *${transfer.amountNative.toFixed(4)} ${transfer.symbol}* ${
           transfer.direction === "out" ? "to" : "from"
         }:\n\`${transfer.counterparty}\`\n\n` +
@@ -156,13 +160,20 @@ async function main(): Promise<void> {
       const kb = new InlineKeyboard()
         .text(`🔍 Investigate ${shortAddress(transfer.counterparty, 4, 4)}`, `dg:${sc}:${transfer.counterparty}`)
         .text(`👁️ Watch ${shortAddress(transfer.counterparty, 4, 4)}`, `dw:${sc}:${transfer.counterparty}`);
-      await botInstance.api
-        .sendMessage(telegramId, msg, {
+      try {
+        await botInstance.api.sendMessage(telegramId, msg, {
           parse_mode: "Markdown",
           reply_markup: kb,
           link_preview_options: { is_disabled: true }
-        })
-        .catch(() => {});
+        });
+      } catch {
+        await botInstance.api
+          .sendMessage(telegramId, stripMdForFallback(msg), {
+            reply_markup: kb,
+            link_preview_options: { is_disabled: true }
+          })
+          .catch(() => {});
+      }
     }
   });
 

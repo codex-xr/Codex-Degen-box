@@ -35,13 +35,26 @@ export class EvmClientManager {
 
   constructor(config: AppConfig) {
     this.config = config;
+
+    // PublicNode (Allnodes) blocks eth_getLogs without a contract address and mainnet.base.org
+    // aggressively rate-limits log scans; promote getLogs-friendly RPCs first when those defaults are active.
+    const ethUrls = this.buildRpcList(config.ethRpcUrl, [
+      "https://eth.drpc.org",
+      "https://ethereum-rpc.publicnode.com"
+    ], ["publicnode.com"]);
     this.ethClient = createPublicClient({
       chain: mainnet,
-      transport: http(config.ethRpcUrl, { timeout: 10_000, retryCount: 2 })
+      transport: fallback(ethUrls.map((url) => http(url, { timeout: 10_000, retryCount: 1 })))
     }) as PublicClient;
+
+    const baseUrls = this.buildRpcList(config.baseRpcUrl, [
+      "https://base.drpc.org",
+      "https://1rpc.io/base",
+      "https://mainnet.base.org"
+    ], ["mainnet.base.org", "publicnode.com"]);
     this.baseClient = createPublicClient({
       chain: base,
-      transport: http(config.baseRpcUrl, { timeout: 10_000, retryCount: 2 })
+      transport: fallback(baseUrls.map((url) => http(url, { timeout: 10_000, retryCount: 1 })))
     }) as PublicClient;
 
     const rhTransports = [http(config.robinhoodRpcUrl, { timeout: 10_000, retryCount: 1 })];
@@ -53,6 +66,15 @@ export class EvmClientManager {
       chain: robinhoodChain,
       transport: fallback(rhTransports)
     }) as PublicClient;
+  }
+
+  private buildRpcList(configuredUrl: string, fallbacks: string[], demoteHosts: string[]): string[] {
+    const cleaned = configuredUrl.trim();
+    const isRestrictedPublic = cleaned && demoteHosts.some((h) => cleaned.includes(h));
+    const ordered = isRestrictedPublic
+      ? [...fallbacks, cleaned]
+      : [cleaned, ...fallbacks];
+    return [...new Set(ordered.filter(Boolean))];
   }
 
   getClient(chain: EvmChainKey): PublicClient {

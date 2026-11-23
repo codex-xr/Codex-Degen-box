@@ -73,6 +73,7 @@ export class WalletWatcherService {
   private solanaLastSigs = new Map<string, string>();
   private evmLastBlocks = new Map<EvmChainKey, bigint>();
   private seenTxKeys = new Set<string>();
+  private solanaInFlight = new Set<string>();
 
   private evmTimer: NodeJS.Timeout | null = null;
   private solanaPollTimer: NodeJS.Timeout | null = null;
@@ -177,21 +178,40 @@ export class WalletWatcherService {
     // Subscribe newly added addresses for sub-second push detection
     for (const addr of activeAddrs) {
       if (this.solanaSubscriptions.has(addr)) continue;
+      this.subscribeSolanaAddress(addr);
+    }
+  }
+
+  private subscribeSolanaAddress(addr: string): boolean {
+    try {
+      const pubkey = new PublicKey(addr);
+      const subId = this.solanaClient.connection.onLogs(
+        pubkey,
+        (logInfo) => {
+          if (logInfo.err) return;
+          void this.handleSolanaSignature(addr, logInfo.signature);
+        },
+        "confirmed"
+      );
+      this.solanaSubscriptions.set(addr, subId);
+      return true;
+    } catch {
+      // Fallback poll will still pick up transactions if WS subscription fails
+      return false;
+    }
+  }
+
+  private async resubscribeSolanaAddress(addr: string): Promise<void> {
+    const oldId = this.solanaSubscriptions.get(addr);
+    if (oldId !== undefined) {
+      this.solanaSubscriptions.delete(addr);
       try {
-        const pubkey = new PublicKey(addr);
-        const subId = this.solanaClient.connection.onLogs(
-          pubkey,
-          (logInfo) => {
-            if (logInfo.err) return;
-            void this.handleSolanaSignature(addr, logInfo.signature);
-          },
-          "confirmed"
-        );
-        this.solanaSubscriptions.set(addr, subId);
+        await this.solanaClient.connection.removeOnLogsListener(oldId);
       } catch {
-        // Fallback poll will still pick up transactions if WS subscription fails
+        // ignore
       }
     }
+    this.subscribeSolanaAddress(addr);
   }
 
   private async pollSolanaFallback(): Promise<void> {
@@ -206,21 +226,53 @@ export class WalletWatcherService {
       for (const addr of solAddresses) {
         try {
           const sigs = await this.solanaRpcSingle<
-            Array<{ signature: string; err: unknown }>
-          >("getSignaturesForAddress", [addr, { limit: 15 }]);
+            Array<{ signature: string; err: unknown; blockTime?: number | null }>
+          >("getSignaturesForAddress", [addr, { limit: 25 }]);
           if (!sigs || sigs.length === 0) continue;
 
           const latest = sigs[0].signature;
           const prev = this.solanaLastSigs.get(addr);
-          this.solanaLastSigs.set(addr, latest);
 
           // Skip historical backfill on first start so we only copy LIVE trades from now on
-          if (!prev) continue;
+          if (!prev) {
+            this.solanaLastSigs.set(addr, latest);
+            continue;
+          }
 
+          const pending: Array<{ signature: string; blockTime?: number | null }> = [];
           for (const info of sigs) {
             if (info.signature === prev) break;
             if (info.err) continue;
-            await this.handleSolanaSignature(addr, info.signature);
+            pending.push(info);
+          }
+
+          if (pending.length === 0) {
+            this.solanaLastSigs.set(addr, latest);
+            continue;
+          }
+
+          // Process oldest -> newest so buys settle before sells
+          const chronological = [...pending].reverse();
+          let wsMissedOldTx = false;
+          let lastCompletedSig = prev;
+
+          for (const item of chronological) {
+            const seenBefore = this.seenTxKeys.has(`solana:${addr}:${item.signature}`);
+            if (!seenBefore && item.blockTime && Date.now() / 1000 - Number(item.blockTime) > 18) {
+              wsMissedOldTx = true;
+            }
+            const ok = await this.handleSolanaSignature(addr, item.signature);
+            if (!ok) {
+              // Stop advancing bookmark here so next poll retries failed RPC fetches
+              break;
+            }
+            lastCompletedSig = item.signature;
+          }
+
+          this.solanaLastSigs.set(addr, lastCompletedSig);
+
+          if (wsMissedOldTx) {
+            await this.resubscribeSolanaAddress(addr);
           }
         } catch {
           // ignore transient RPC issue
@@ -235,6 +287,9 @@ export class WalletWatcherService {
     const endpoints = [this.config.solanaRpcUrl];
     if (!endpoints.includes("https://solana-rpc.publicnode.com")) {
       endpoints.push("https://solana-rpc.publicnode.com");
+    }
+    if (!endpoints.includes("https://api.mainnet-beta.solana.com")) {
+      endpoints.push("https://api.mainnet-beta.solana.com");
     }
     for (const rpcUrl of endpoints) {
       try {
@@ -256,22 +311,38 @@ export class WalletWatcherService {
     return null;
   }
 
-  async handleSolanaSignature(walletAddress: string, signature: string): Promise<void> {
+  async handleSolanaSignature(walletAddress: string, signature: string): Promise<boolean> {
     const dedupKey = `solana:${walletAddress}:${signature}`;
-    if (this.markSeen(dedupKey)) return;
+    if (this.seenTxKeys.has(dedupKey) || this.solanaInFlight.has(dedupKey)) return true;
 
-    const result = await this.inspectSolanaTx(walletAddress, signature);
-    if (result?.swap) {
-      await this.dispatchSwap(result.swap);
-    } else if (result?.transfer) {
-      await this.dispatchTransfer(result.transfer);
+    this.solanaInFlight.add(dedupKey);
+    try {
+      const outcome = await this.inspectSolanaTx(walletAddress, signature);
+      if (!outcome.fetched) {
+        return false;
+      }
+      this.markSeen(dedupKey);
+
+      for (const swap of outcome.swaps) {
+        await this.dispatchSwap(swap);
+      }
+      if (outcome.swaps.length === 0 && outcome.transfer) {
+        await this.dispatchTransfer(outcome.transfer);
+      }
+      return true;
+    } finally {
+      this.solanaInFlight.delete(dedupKey);
     }
   }
 
   private async inspectSolanaTx(
     walletAddress: string,
     signature: string
-  ): Promise<{ swap?: DetectedWalletSwap; transfer?: DetectedWalletTransfer } | null> {
+  ): Promise<{ swaps: DetectedWalletSwap[]; transfer?: DetectedWalletTransfer; fetched: boolean }> {
+    const wsol = CHAINS.solana.wrappedNativeAddress;
+    const stables = new Set(CHAINS.solana.knownStableAddresses);
+    const isQuote = (mint: string) => mint === wsol || stables.has(mint);
+
     if (this.config.heliusApiKey) {
       try {
         const res = await fetch(
@@ -306,31 +377,45 @@ export class WalletWatcherService {
           }>;
           const tx = txs[0];
           if (tx) {
-            const parsed = this.extractSwapFromHeliusTx(walletAddress, signature, tx);
-            if (parsed) return { swap: parsed };
+            const parsed = this.extractSwapsFromHeliusTx(walletAddress, signature, tx);
+            if (parsed.length > 0) return { swaps: parsed, fetched: true };
 
-            const bigNative = (tx.nativeTransfers ?? []).find(
-              (nt) =>
-                (nt.fromUserAccount === walletAddress || nt.toUserAccount === walletAddress) &&
-                Number(nt.amount ?? 0) >= 50_000_000
+            const hasNonQuoteTokenMove = (tx.tokenTransfers ?? []).some(
+              (t) =>
+                t.mint &&
+                !isQuote(t.mint) &&
+                (t.toUserAccount === walletAddress || t.fromUserAccount === walletAddress)
             );
-            if (bigNative) {
-              const isOut = bigNative.fromUserAccount === walletAddress;
-              const other = isOut ? bigNative.toUserAccount : bigNative.fromUserAccount;
-              if (other && other !== walletAddress && !SOL_SYSTEM_SKIP.has(other)) {
-                return {
-                  transfer: {
-                    chain: "solana",
-                    walletAddress,
-                    txHash: signature,
-                    direction: isOut ? "out" : "in",
-                    counterparty: other,
-                    amountNative: Number(bigNative.amount) / 1e9,
-                    symbol: "SOL",
-                    detectedAt: Date.now()
-                  }
-                };
+
+            // If Helius left an unparsed router tx as UNKNOWN while moving non-quote tokens,
+            // let standard RPC balance-diff parsing classify it before assuming a plain SOL transfer.
+            if (!hasNonQuoteTokenMove) {
+              const bigNative = (tx.nativeTransfers ?? []).find(
+                (nt) =>
+                  (nt.fromUserAccount === walletAddress || nt.toUserAccount === walletAddress) &&
+                  Number(nt.amount ?? 0) >= 50_000_000
+              );
+              if (bigNative) {
+                const isOut = bigNative.fromUserAccount === walletAddress;
+                const other = isOut ? bigNative.toUserAccount : bigNative.fromUserAccount;
+                if (other && other !== walletAddress && !SOL_SYSTEM_SKIP.has(other)) {
+                  return {
+                    swaps: [],
+                    transfer: {
+                      chain: "solana",
+                      walletAddress,
+                      txHash: signature,
+                      direction: isOut ? "out" : "in",
+                      counterparty: other,
+                      amountNative: Number(bigNative.amount) / 1e9,
+                      symbol: "SOL",
+                      detectedAt: Date.now()
+                    },
+                    fetched: true
+                  };
+                }
               }
+              return { swaps: [], fetched: true };
             }
           }
         }
@@ -344,16 +429,16 @@ export class WalletWatcherService {
         signature,
         { encoding: "jsonParsed", maxSupportedTransactionVersion: 1 }
       ]);
-      if (!parsedTx || !parsedTx.meta || parsedTx.meta.err) return null;
+      if (!parsedTx) return { swaps: [], fetched: false };
+      if (!parsedTx.meta || parsedTx.meta.err) return { swaps: [], fetched: true };
 
-      const swap = this.extractSwapFromSolanaBalanceDiffs(walletAddress, signature, parsedTx);
-      if (swap) return { swap };
+      const swaps = this.extractSwapsFromSolanaBalanceDiffs(walletAddress, signature, parsedTx);
+      if (swaps.length > 0) return { swaps, fetched: true };
 
       const transfer = this.extractTransferFromSolanaBalanceDiffs(walletAddress, signature, parsedTx);
-      if (transfer) return { transfer };
-      return null;
+      return { swaps: [], transfer: transfer ?? undefined, fetched: true };
     } catch {
-      return null;
+      return { swaps: [], fetched: false };
     }
   }
 
@@ -414,12 +499,13 @@ export class WalletWatcherService {
     return null;
   }
 
-  private extractSwapFromHeliusTx(
+  private extractSwapsFromHeliusTx(
     walletAddress: string,
     signature: string,
     tx: {
       type?: string;
       source?: string;
+      nativeTransfers?: Array<{ fromUserAccount?: string; toUserAccount?: string; amount?: number }>;
       tokenTransfers?: Array<{
         fromUserAccount?: string;
         toUserAccount?: string;
@@ -435,7 +521,7 @@ export class WalletWatcherService {
         };
       };
     }
-  ): DetectedWalletSwap | null {
+  ): DetectedWalletSwap[] {
     const wsol = CHAINS.solana.wrappedNativeAddress;
     const stables = new Set(CHAINS.solana.knownStableAddresses);
     const isQuote = (mint: string) => mint === wsol || stables.has(mint);
@@ -453,27 +539,34 @@ export class WalletWatcherService {
       }
     }
 
+    let nativeOutLamports = 0;
+    let nativeInLamports = 0;
+    for (const nt of tx.nativeTransfers ?? []) {
+      const amt = Number(nt.amount ?? 0);
+      if (amt <= 0) continue;
+      if (nt.fromUserAccount === walletAddress && nt.toUserAccount !== walletAddress) {
+        nativeOutLamports += amt;
+      }
+      if (nt.toUserAccount === walletAddress && nt.fromUserAccount !== walletAddress) {
+        nativeInLamports += amt;
+      }
+    }
+
     const boughtToken = [...tokenIn.entries()].find(([mint]) => !isQuote(mint));
     const soldToken = [...tokenOut.entries()].find(([mint]) => !isQuote(mint));
     const swapEv = tx.events?.swap;
+    const swaps: DetectedWalletSwap[] = [];
 
-    if (boughtToken && (swapEv || tx.type === "SWAP" || tokenOut.size > 0)) {
-      const nativeAmt = swapEv?.nativeInput?.amount ? BigInt(swapEv.nativeInput.amount) : null;
-      return {
-        chain: "solana",
-        walletAddress,
-        txHash: signature,
-        side: "buy",
-        tokenAddress: boughtToken[0],
-        walletNativeAmountAtomic: nativeAmt,
-        dex: tx.source,
-        detectedAt: Date.now()
-      };
-    }
-
-    if (soldToken && (swapEv || tx.type === "SWAP" || tokenIn.size > 0)) {
-      const nativeAmt = swapEv?.nativeOutput?.amount ? BigInt(swapEv.nativeOutput.amount) : null;
-      return {
+    if (
+      soldToken &&
+      (swapEv || tx.type === "SWAP" || tokenIn.size > 0 || nativeInLamports >= 500_000)
+    ) {
+      const nativeAmt = swapEv?.nativeOutput?.amount
+        ? BigInt(swapEv.nativeOutput.amount)
+        : nativeInLamports >= 500_000
+          ? BigInt(Math.round(nativeInLamports))
+          : null;
+      swaps.push({
         chain: "solana",
         walletAddress,
         txHash: signature,
@@ -482,19 +575,40 @@ export class WalletWatcherService {
         walletNativeAmountAtomic: nativeAmt,
         dex: tx.source,
         detectedAt: Date.now()
-      };
+      });
     }
 
-    return null;
+    if (
+      boughtToken &&
+      (swapEv || tx.type === "SWAP" || tokenOut.size > 0 || nativeOutLamports >= 500_000)
+    ) {
+      const nativeAmt = swapEv?.nativeInput?.amount
+        ? BigInt(swapEv.nativeInput.amount)
+        : nativeOutLamports >= 500_000
+          ? BigInt(Math.round(nativeOutLamports))
+          : null;
+      swaps.push({
+        chain: "solana",
+        walletAddress,
+        txHash: signature,
+        side: "buy",
+        tokenAddress: boughtToken[0],
+        walletNativeAmountAtomic: nativeAmt,
+        dex: tx.source,
+        detectedAt: Date.now()
+      });
+    }
+
+    return swaps;
   }
 
-  private extractSwapFromSolanaBalanceDiffs(
+  private extractSwapsFromSolanaBalanceDiffs(
     walletAddress: string,
     signature: string,
     parsedTx: RawSolanaParsedTx
-  ): DetectedWalletSwap | null {
+  ): DetectedWalletSwap[] {
     const meta = parsedTx.meta;
-    if (!meta) return null;
+    if (!meta) return [];
 
     const wsol = CHAINS.solana.wrappedNativeAddress;
     const stables = new Set(CHAINS.solana.knownStableAddresses);
@@ -540,20 +654,9 @@ export class WalletWatcherService {
       solDelta = BigInt(meta.postBalances[idx]!) - BigInt(meta.preBalances[idx]!);
     }
 
-    if (boughtMint && (solDelta < -100_000n || quoteSpent || soldMint !== null)) {
-      return {
-        chain: "solana",
-        walletAddress,
-        txHash: signature,
-        side: "buy",
-        tokenAddress: boughtMint,
-        walletNativeAmountAtomic: solDelta < 0n ? -solDelta : null,
-        detectedAt: Date.now()
-      };
-    }
-
+    const swaps: DetectedWalletSwap[] = [];
     if (soldMint && (solDelta > 100_000n || quoteGained || boughtMint !== null)) {
-      return {
+      swaps.push({
         chain: "solana",
         walletAddress,
         txHash: signature,
@@ -561,10 +664,22 @@ export class WalletWatcherService {
         tokenAddress: soldMint,
         walletNativeAmountAtomic: solDelta > 0n ? solDelta : null,
         detectedAt: Date.now()
-      };
+      });
     }
 
-    return null;
+    if (boughtMint && (solDelta < -100_000n || quoteSpent || soldMint !== null)) {
+      swaps.push({
+        chain: "solana",
+        walletAddress,
+        txHash: signature,
+        side: "buy",
+        tokenAddress: boughtMint,
+        walletNativeAmountAtomic: solDelta < 0n ? -solDelta : null,
+        detectedAt: Date.now()
+      });
+    }
+
+    return swaps;
   }
 
   private async pollEvmChains(): Promise<void> {
@@ -605,92 +720,124 @@ export class WalletWatcherService {
     }
     if (latestBlock <= prevBlock) return;
 
-    const fromBlock = latestBlock - prevBlock > 25n ? latestBlock - 10n : prevBlock + 1n;
-    this.evmLastBlocks.set(chain, latestBlock);
-
+    const scanStart = latestBlock - prevBlock > 30n ? latestBlock - 30n : prevBlock + 1n;
     const addressList = [...watched] as `0x${string}`[];
+    const inspectedInScan = new Set<string>();
 
-    try {
-      const [incomingLogs, outgoingLogs] = await Promise.all([
-        client.getLogs({
-          event: TRANSFER_EVENT,
-          args: { to: addressList },
-          fromBlock,
-          toBlock: latestBlock
-        }),
-        client.getLogs({
-          event: TRANSFER_EVENT,
-          args: { from: addressList },
-          fromBlock,
-          toBlock: latestBlock
-        })
-      ]);
-
+    // Scan in <=10-block chunks and advance evmLastBlocks ONLY after each chunk succeeds
+    for (let chunkStart = scanStart; chunkStart <= latestBlock; chunkStart += 10n) {
+      const chunkEnd = chunkStart + 9n < latestBlock ? chunkStart + 9n : latestBlock;
       const txsToInspect = new Map<string, Set<string>>();
-      for (const log of incomingLogs) {
-        const to = log.args.to?.toLowerCase();
-        if (!to || !log.transactionHash) continue;
-        const set = txsToInspect.get(log.transactionHash) ?? new Set<string>();
-        set.add(to);
-        txsToInspect.set(log.transactionHash, set);
-      }
-      for (const log of outgoingLogs) {
-        const from = log.args.from?.toLowerCase();
-        if (!from || !log.transactionHash) continue;
-        const set = txsToInspect.get(log.transactionHash) ?? new Set<string>();
-        set.add(from);
-        txsToInspect.set(log.transactionHash, set);
-      }
+      let chunkScanned = false;
 
-      for (const [txHash, wallets] of txsToInspect.entries()) {
-        await this.inspectEvmTransaction(chain, client, txHash as `0x${string}`, [...wallets]);
-      }
+      try {
+        const [incomingLogs, outgoingLogs] = await Promise.all([
+          client.getLogs({
+            event: TRANSFER_EVENT,
+            args: { to: addressList },
+            fromBlock: chunkStart,
+            toBlock: chunkEnd
+          }),
+          client.getLogs({
+            event: TRANSFER_EVENT,
+            args: { from: addressList },
+            fromBlock: chunkStart,
+            toBlock: chunkEnd
+          })
+        ]);
 
-      // Check direct native ETH transfers in up to latest 2 blocks if transferAlerts is enabled
-      if (hasTransferAlerts && this.onTransferAlert) {
-        const startNativeBlk = latestBlock - fromBlock > 1n ? latestBlock - 1n : fromBlock;
-        for (let blk = startNativeBlk; blk <= latestBlock; blk++) {
+        for (const log of incomingLogs) {
+          const to = log.args.to?.toLowerCase();
+          if (!to || !log.transactionHash) continue;
+          const set = txsToInspect.get(log.transactionHash) ?? new Set<string>();
+          set.add(to);
+          txsToInspect.set(log.transactionHash, set);
+        }
+        for (const log of outgoingLogs) {
+          const from = log.args.from?.toLowerCase();
+          if (!from || !log.transactionHash) continue;
+          const set = txsToInspect.get(log.transactionHash) ?? new Set<string>();
+          set.add(from);
+          txsToInspect.set(log.transactionHash, set);
+        }
+        chunkScanned = true;
+      } catch {
+        // Fallback: scan block transactions directly when an RPC rejects eth_getLogs
+        const fallbackBlocks = chunkEnd - chunkStart > 4n ? chunkEnd - 4n : chunkStart;
+        let blkOk = false;
+        for (let blk = fallbackBlocks; blk <= chunkEnd; blk++) {
           const block = await client.getBlock({ blockNumber: blk, includeTransactions: true }).catch(() => null);
           if (!block) continue;
+          blkOk = true;
           for (const tx of block.transactions) {
             if (typeof tx === "string") continue;
             const from = tx.from.toLowerCase();
-            const to = tx.to?.toLowerCase() ?? "";
-            if (!to || (tx.input && tx.input.length > 2) || tx.value < 5_000_000_000_000_000n) continue;
-            if (watched.has(from) && !watched.has(to)) {
-              const dedup = `${chain}:${from}:${tx.hash}:xfer`;
-              if (!this.markSeen(dedup)) {
-                await this.dispatchTransfer({
-                  chain,
-                  walletAddress: from,
-                  txHash: tx.hash,
-                  direction: "out",
-                  counterparty: to,
-                  amountNative: atomicToNumber(tx.value, 18),
-                  symbol: "ETH",
-                  detectedAt: Date.now()
-                });
-              }
-            } else if (watched.has(to) && !watched.has(from)) {
-              const dedup = `${chain}:${to}:${tx.hash}:xfer`;
-              if (!this.markSeen(dedup)) {
-                await this.dispatchTransfer({
-                  chain,
-                  walletAddress: to,
-                  txHash: tx.hash,
-                  direction: "in",
-                  counterparty: from,
-                  amountNative: atomicToNumber(tx.value, 18),
-                  symbol: "ETH",
-                  detectedAt: Date.now()
-                });
-              }
+            if (watched.has(from) && tx.input && tx.input.length > 10) {
+              const set = txsToInspect.get(tx.hash) ?? new Set<string>();
+              set.add(from);
+              txsToInspect.set(tx.hash, set);
+            }
+          }
+        }
+        chunkScanned = blkOk;
+      }
+
+      if (!chunkScanned) {
+        // Leave evmLastBlocks before this failed chunk so next poll retries cleanly
+        break;
+      }
+
+      for (const [txHash, wallets] of txsToInspect.entries()) {
+        inspectedInScan.add(txHash.toLowerCase());
+        await this.inspectEvmTransaction(chain, client, txHash as `0x${string}`, [...wallets]);
+      }
+
+      this.evmLastBlocks.set(chain, chunkEnd);
+    }
+
+    // Check direct native ETH transfers in up to latest 2 blocks if transferAlerts is enabled
+    if (hasTransferAlerts && this.onTransferAlert) {
+      const startNativeBlk = latestBlock - scanStart > 1n ? latestBlock - 1n : scanStart;
+      for (let blk = startNativeBlk; blk <= latestBlock; blk++) {
+        const block = await client.getBlock({ blockNumber: blk, includeTransactions: true }).catch(() => null);
+        if (!block) continue;
+        for (const tx of block.transactions) {
+          if (typeof tx === "string") continue;
+          if (inspectedInScan.has(tx.hash.toLowerCase())) continue;
+          const from = tx.from.toLowerCase();
+          const to = tx.to?.toLowerCase() ?? "";
+          if (!to || (tx.input && tx.input.length > 2) || tx.value < 5_000_000_000_000_000n) continue;
+          if (watched.has(from) && !watched.has(to)) {
+            const dedup = `${chain}:${from}:${tx.hash}:xfer`;
+            if (!this.markSeen(dedup)) {
+              await this.dispatchTransfer({
+                chain,
+                walletAddress: from,
+                txHash: tx.hash,
+                direction: "out",
+                counterparty: to,
+                amountNative: atomicToNumber(tx.value, 18),
+                symbol: "ETH",
+                detectedAt: Date.now()
+              });
+            }
+          } else if (watched.has(to) && !watched.has(from)) {
+            const dedup = `${chain}:${to}:${tx.hash}:xfer`;
+            if (!this.markSeen(dedup)) {
+              await this.dispatchTransfer({
+                chain,
+                walletAddress: to,
+                txHash: tx.hash,
+                direction: "in",
+                counterparty: from,
+                amountNative: atomicToNumber(tx.value, 18),
+                symbol: "ETH",
+                detectedAt: Date.now()
+              });
             }
           }
         }
       }
-    } catch {
-      // Transient RPC log query failure
     }
   }
 
@@ -771,6 +918,19 @@ export class WalletWatcherService {
           continue;
         }
 
+        if (soldToken) {
+          await this.dispatchSwap({
+            chain,
+            walletAddress: wallet,
+            txHash,
+            side: "sell",
+            tokenAddress: soldToken,
+            walletNativeAmountAtomic: null,
+            dex: "uniswap",
+            detectedAt: Date.now()
+          });
+        }
+
         if (boughtToken) {
           let symbolHint: string | undefined;
           try {
@@ -791,17 +951,6 @@ export class WalletWatcherService {
             tokenAddress: boughtToken,
             tokenSymbolHint: symbolHint,
             walletNativeAmountAtomic: quoteNativeSpent,
-            dex: "uniswap",
-            detectedAt: Date.now()
-          });
-        } else if (soldToken) {
-          await this.dispatchSwap({
-            chain,
-            walletAddress: wallet,
-            txHash,
-            side: "sell",
-            tokenAddress: soldToken,
-            walletNativeAmountAtomic: null,
             dex: "uniswap",
             detectedAt: Date.now()
           });

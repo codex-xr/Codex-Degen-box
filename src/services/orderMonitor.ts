@@ -1,3 +1,4 @@
+import { escapeMd } from "../bot/formatters.js";
 import { ChainKey, CHAINS } from "../chains/registry.js";
 import { IAdminDb, IUserVault, IVaultManager, OrderRow, PositionRow } from "../db/types.js";
 import { formatExactUnits, formatUsd } from "../utils/amounts.js";
@@ -110,7 +111,7 @@ export class OrderMonitorService {
           });
           await this.onNotify(
             userId,
-            `🚨 *Liquidity Pulled (Simulated Rug)* on *${pos.tokenSymbol}* (${CHAINS[pos.chain].shortBadge})\n` +
+            `🚨 *Liquidity Pulled (Simulated Rug)* on *${escapeMd(pos.tokenSymbol)}* (${CHAINS[pos.chain].shortBadge})\n` +
               `Position written off at \$0.00 (Loss: ${formatUsd(res.realizedPnlUsd)})`,
             res
           );
@@ -156,14 +157,14 @@ export class OrderMonitorService {
         await this.onNotify(
           userId,
           `🎯 *Limit Buy Filled!* (${spec.shortBadge})\n` +
-            `Bought *${res.tokenSymbol}* for ${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol} @ ${formatUsd(res.mcUsd)} MC`,
+            `Bought *${escapeMd(res.tokenSymbol)}* for ${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol} @ ${formatUsd(res.mcUsd)} MC`,
           res
         );
       } catch (err) {
         await vault.setOrderStatus(order.id, "cancelled");
         await this.onNotify(
           userId,
-          `⚠️ *Limit Buy Cancelled* for *${order.tokenSymbol}*: ${(err as Error).message}`
+          `⚠️ *Limit Buy Cancelled* for *${escapeMd(order.tokenSymbol)}*: ${escapeMd((err as Error).message)}`
         );
       }
       return;
@@ -187,14 +188,14 @@ export class OrderMonitorService {
         await this.onNotify(
           userId,
           `🔁 *DCA Buy Executed* (${spec.shortBadge})\n` +
-            `Bought *${res.tokenSymbol}* for ${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}. Remaining runs: ${remaining}`,
+            `Bought *${escapeMd(res.tokenSymbol)}* for ${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}. Remaining runs: ${remaining}`,
           res
         );
       } catch (err) {
         await vault.setOrderStatus(order.id, "cancelled");
         await this.onNotify(
           userId,
-          `⚠️ *DCA Order Stopped* for *${order.tokenSymbol}*: ${(err as Error).message}`
+          `⚠️ *DCA Order Stopped* for *${escapeMd(order.tokenSymbol)}*: ${escapeMd((err as Error).message)}`
         );
       }
       return;
@@ -261,14 +262,14 @@ export class OrderMonitorService {
       const spec = CHAINS[pos.chain];
       await this.onNotify(
         userId,
-        `⚡ *${label} Triggered!* (${spec.shortBadge})\n` +
-          `Sold ${order.sellPct ?? 100}% of *${pos.tokenSymbol}* → ${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol} (PnL: ${formatUsd(res.realizedPnlUsd)})`,
+        `⚡ *${escapeMd(label)} Triggered!* (${spec.shortBadge})\n` +
+          `Sold ${order.sellPct ?? 100}% of *${escapeMd(pos.tokenSymbol)}* → ${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol} (PnL: ${formatUsd(res.realizedPnlUsd)})`,
         res
       );
     } catch (err) {
       await this.onNotify(
         userId,
-        `⚠️ Failed ${label} for *${pos.tokenSymbol}*: ${(err as Error).message}`
+        `⚠️ Failed ${escapeMd(label)} for *${escapeMd(pos.tokenSymbol)}*: ${escapeMd((err as Error).message)}`
       );
     }
   }
