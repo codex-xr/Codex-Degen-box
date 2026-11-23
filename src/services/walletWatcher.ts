@@ -629,6 +629,11 @@ export class WalletWatcherService {
     if (!this.config.webhookPort) return;
     try {
       this.webhookServer = http.createServer((req, res) => {
+        if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, service: "codex-degen-box" }));
+          return;
+        }
         if (req.method !== "POST" || req.url !== "/helius-webhook") {
           res.writeHead(404).end("Not found");
           return;
@@ -668,7 +673,7 @@ export class WalletWatcherService {
         });
       });
 
-      this.webhookServer.listen(this.config.webhookPort, () => {
+      this.webhookServer.listen(this.config.webhookPort, "0.0.0.0", () => {
         // Listening silently
       });
       this.webhookServer.on("error", () => {

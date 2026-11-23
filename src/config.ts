@@ -88,7 +88,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     birdeyeApiKey: (overrides.birdeyeApiKey ?? process.env.BIRDEYE_API_KEY ?? "").trim(),
     geminiApiKey: (overrides.geminiApiKey ?? process.env.GEMINI_API_KEY ?? "").trim(),
     openaiApiKey: (overrides.openaiApiKey ?? process.env.OPENAI_API_KEY ?? "").trim(),
-    webhookPort: overrides.webhookPort ?? parseNumberEnv("WEBHOOK_PORT", 8787),
+    webhookPort: overrides.webhookPort ?? parseNumberEnv("PORT", parseNumberEnv("WEBHOOK_PORT", 8787)),
     webhookSecret: (overrides.webhookSecret ?? process.env.HELIUS_WEBHOOK_SECRET ?? "").trim(),
     orderPollMs: overrides.orderPollMs ?? parseNumberEnv("ORDER_POLL_MS", 5000),
     evmPollMs: overrides.evmPollMs ?? parseNumberEnv("EVM_POLL_MS", 2500),
