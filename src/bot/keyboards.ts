@@ -150,6 +150,8 @@ export function buildWatchersKeyboard(watchers: WatchedWalletRow[]): InlineKeybo
     kb.text(`${icon} ${w.alias} (${CHAINS[w.chain].shortBadge})`, `watch:view:${w.id}`).row();
   }
   kb.text("➕ Watch New Wallet", "watch:add:start")
+    .text("🏆 Leaderboard", "watch:board")
+    .row()
     .text("🏠 Main Menu", "nav:home");
   return kb;
 }
@@ -174,6 +176,9 @@ export function buildWatcherDetailKeyboard(w: WatchedWalletRow): InlineKeyboard 
     .text(`🚨 Funding Alerts: ${w.transferAlerts ? "ON" : "OFF"}`, `watch:toggle:${w.id}:transferAlerts`)
     .text(`🔁 Mirror Sells: ${w.mirrorSells ? "ON" : "OFF"}`, `watch:toggle:${w.id}:mirrorSells`)
     .row()
+    .text(`📉 Sell Match: ${w.sellMode === "proportional" ? "Proportional" : "Full 100%"}`, `watch:toggle:${w.id}:sellMode`)
+    .text(`🚀 Dev Snipe: ${w.snipeDevLaunches ? "ON" : "OFF"}`, `watch:toggle:${w.id}:snipeDevLaunches`)
+    .row()
     .text(`🛡️ Block Risky: ${w.blockRisky ? "ON" : "OFF"}`, `watch:toggle:${w.id}:blockRisky`)
     .text(`⚡ Skip Held: ${w.skipIfHeld ? "ON" : "OFF"}`, `watch:toggle:${w.id}:skipIfHeld`)
     .row()
@@ -183,7 +188,12 @@ export function buildWatcherDetailKeyboard(w: WatchedWalletRow): InlineKeyboard 
     )
     .text("🎯 Set Auto TP/SL", `watch:filter:${w.id}:tp_sl`)
     .row()
+    .text(
+      `📈 Trail Stop: ${w.autoTrailingPct ? `${w.autoTrailingPct}%` : "Off"}`,
+      `watch:filter:${w.id}:trail`
+    )
     .text("📏 Min MC", `watch:filter:${w.id}:min_mc`)
+    .row()
     .text("📏 Max MC", `watch:filter:${w.id}:max_mc`)
     .text("💧 Min Liq", `watch:filter:${w.id}:min_liq`)
     .row()
@@ -305,6 +315,11 @@ export function buildSettingsKeyboard(settings: UserSettings): InlineKeyboard {
       `🔔 Copy Alerts: ${settings.copyNotify ? "ON" : "OFF"}`,
       "set:toggle:copyNotify"
     )
+    .text(
+      `⏭️ Skip Alerts: ${settings.notifySkips ? "ON" : "OFF"}`,
+      "set:toggle:notifySkips"
+    )
+    .row()
     .text(
       `📊 Weekly Auto-Report: ${settings.weeklyReportEnabled ? "ON" : "OFF"}`,
       "set:toggle:weeklyReport"

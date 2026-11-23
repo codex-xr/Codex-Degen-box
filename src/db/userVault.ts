@@ -11,6 +11,7 @@ import {
   OrderRow,
   PnlTheme,
   PositionRow,
+  SellMode,
   SimMode,
   TradeRow,
   UserSettings,
@@ -165,9 +166,12 @@ export class UserVault implements IUserVault {
         mirror_sells INTEGER NOT NULL DEFAULT 1,
         block_risky INTEGER NOT NULL DEFAULT 1,
         transfer_alerts INTEGER NOT NULL DEFAULT 1,
+        snipe_dev_launches INTEGER NOT NULL DEFAULT 0,
+        sell_mode TEXT NOT NULL DEFAULT 'full',
         sim_mode TEXT NOT NULL DEFAULT 'realistic',
         auto_tp_pct REAL,
         auto_sl_pct REAL,
+        auto_trailing_pct REAL,
         last_seen_tx TEXT,
         created_at INTEGER NOT NULL,
         UNIQUE(chain, address)
@@ -208,6 +212,15 @@ export class UserVault implements IUserVault {
     if (!cols.some((c) => c.name === "transfer_alerts")) {
       this.db.exec(`ALTER TABLE watched_wallets ADD COLUMN transfer_alerts INTEGER NOT NULL DEFAULT 1;`);
     }
+    if (!cols.some((c) => c.name === "snipe_dev_launches")) {
+      this.db.exec(`ALTER TABLE watched_wallets ADD COLUMN snipe_dev_launches INTEGER NOT NULL DEFAULT 0;`);
+    }
+    if (!cols.some((c) => c.name === "sell_mode")) {
+      this.db.exec(`ALTER TABLE watched_wallets ADD COLUMN sell_mode TEXT NOT NULL DEFAULT 'full';`);
+    }
+    if (!cols.some((c) => c.name === "auto_trailing_pct")) {
+      this.db.exec(`ALTER TABLE watched_wallets ADD COLUMN auto_trailing_pct REAL;`);
+    }
   }
 
   private seedDefaults(): void {
@@ -229,7 +242,8 @@ export class UserVault implements IUserVault {
       sim_delay_ms: String(DEFAULT_USER_SETTINGS.simDelayMs),
       pnl_theme: DEFAULT_USER_SETTINGS.pnlTheme,
       weekly_report_enabled: DEFAULT_USER_SETTINGS.weeklyReportEnabled ? "1" : "0",
-      copy_notify: DEFAULT_USER_SETTINGS.copyNotify ? "1" : "0"
+      copy_notify: DEFAULT_USER_SETTINGS.copyNotify ? "1" : "0",
+      notify_skips: DEFAULT_USER_SETTINGS.notifySkips ? "1" : "0"
     };
     const insertSetting = this.db.prepare(
       `INSERT OR IGNORE INTO user_settings (key, value) VALUES (?, ?)`
@@ -359,7 +373,8 @@ export class UserVault implements IUserVault {
       pnlHideAmounts: map.get("pnl_hide_amounts") === "1",
       hasPnlBg: map.get("pnl_bg_data_url") === "1",
       weeklyReportEnabled: (map.get("weekly_report_enabled") ?? "1") === "1",
-      copyNotify: (map.get("copy_notify") ?? "1") === "1"
+      copyNotify: (map.get("copy_notify") ?? "1") === "1",
+      notifySkips: map.get("notify_skips") === "1"
     };
   }
 
@@ -718,8 +733,8 @@ export class UserVault implements IUserVault {
         `INSERT INTO watched_wallets (
           chain, address, alias, enabled, copy_mode, copy_amount_atomic, copy_percent, max_buy_atomic,
           min_mc_usd, max_mc_usd, min_liq_usd, skip_if_held, mirror_sells, block_risky, transfer_alerts,
-          sim_mode, auto_tp_pct, auto_sl_pct, created_at
-        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          snipe_dev_launches, sell_mode, sim_mode, auto_tp_pct, auto_sl_pct, auto_trailing_pct, created_at
+        ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         input.chain,
@@ -736,9 +751,12 @@ export class UserVault implements IUserVault {
         (input.mirrorSells ?? true) ? 1 : 0,
         (input.blockRisky ?? true) ? 1 : 0,
         (input.transferAlerts ?? true) ? 1 : 0,
+        (input.snipeDevLaunches ?? false) ? 1 : 0,
+        input.sellMode ?? "full",
         input.simMode ?? "realistic",
         input.autoTpPct ?? null,
         input.autoSlPct ?? null,
+        input.autoTrailingPct ?? null,
         now
       );
     return Number(res.lastInsertRowid);
@@ -773,8 +791,9 @@ export class UserVault implements IUserVault {
         `UPDATE watched_wallets SET
           alias = ?, enabled = ?, copy_mode = ?, copy_amount_atomic = ?, copy_percent = ?,
           max_buy_atomic = ?, min_mc_usd = ?, max_mc_usd = ?, min_liq_usd = ?,
-          skip_if_held = ?, mirror_sells = ?, block_risky = ?, transfer_alerts = ?, sim_mode = ?,
-          auto_tp_pct = ?, auto_sl_pct = ?, last_seen_tx = ?
+          skip_if_held = ?, mirror_sells = ?, block_risky = ?, transfer_alerts = ?,
+          snipe_dev_launches = ?, sell_mode = ?, sim_mode = ?,
+          auto_tp_pct = ?, auto_sl_pct = ?, auto_trailing_pct = ?, last_seen_tx = ?
          WHERE id = ?`
       )
       .run(
@@ -791,9 +810,12 @@ export class UserVault implements IUserVault {
         (patch.mirrorSells ?? current.mirrorSells) ? 1 : 0,
         (patch.blockRisky ?? current.blockRisky) ? 1 : 0,
         (patch.transferAlerts ?? current.transferAlerts) ? 1 : 0,
+        (patch.snipeDevLaunches ?? current.snipeDevLaunches) ? 1 : 0,
+        patch.sellMode ?? current.sellMode,
         patch.simMode ?? current.simMode,
         patch.autoTpPct !== undefined ? patch.autoTpPct : current.autoTpPct,
         patch.autoSlPct !== undefined ? patch.autoSlPct : current.autoSlPct,
+        patch.autoTrailingPct !== undefined ? patch.autoTrailingPct : current.autoTrailingPct,
         patch.lastSeenTx !== undefined ? patch.lastSeenTx : current.lastSeenTx,
         id
       );
@@ -978,9 +1000,15 @@ export class UserVault implements IUserVault {
       mirrorSells: Number(row.mirror_sells) === 1,
       blockRisky: Number(row.block_risky) === 1,
       transferAlerts: row.transfer_alerts === null || row.transfer_alerts === undefined ? true : Number(row.transfer_alerts) === 1,
+      snipeDevLaunches: Number(row.snipe_dev_launches ?? 0) === 1,
+      sellMode: (row.sell_mode ? String(row.sell_mode) : "full") as SellMode,
       simMode: String(row.sim_mode) as SimMode,
       autoTpPct: row.auto_tp_pct !== null ? Number(row.auto_tp_pct) : null,
       autoSlPct: row.auto_sl_pct !== null ? Number(row.auto_sl_pct) : null,
+      autoTrailingPct:
+        row.auto_trailing_pct !== null && row.auto_trailing_pct !== undefined
+          ? Number(row.auto_trailing_pct)
+          : null,
       lastSeenTx: row.last_seen_tx ? String(row.last_seen_tx) : null,
       createdAt: Number(row.created_at)
     };

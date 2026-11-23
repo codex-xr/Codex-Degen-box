@@ -166,7 +166,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     openaiApiKey: (overrides.openaiApiKey ?? process.env.OPENAI_API_KEY ?? "").trim(),
     webhookPort: overrides.webhookPort ?? parseNumberEnv("PORT", parseNumberEnv("WEBHOOK_PORT", 8787)),
     webhookSecret: (overrides.webhookSecret ?? process.env.HELIUS_WEBHOOK_SECRET ?? "").trim(),
-    orderPollMs: overrides.orderPollMs ?? parseNumberEnv("ORDER_POLL_MS", 5000),
+    orderPollMs: overrides.orderPollMs ?? parseNumberEnv("ORDER_POLL_MS", 2000),
     evmPollMs: overrides.evmPollMs ?? parseNumberEnv("EVM_POLL_MS", 2500),
     solanaFallbackPollMs: overrides.solanaFallbackPollMs ?? parseNumberEnv("SOLANA_FALLBACK_POLL_MS", 5000),
     weeklyReportDayUtc: overrides.weeklyReportDayUtc ?? parseNumberEnv("WEEKLY_REPORT_DAY_UTC", 0),

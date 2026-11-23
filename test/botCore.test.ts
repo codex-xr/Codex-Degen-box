@@ -4,8 +4,14 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { escapeMd, stripMdForFallback } from "../src/bot/formatters.js";
-import { buildDetectiveKeyboard, buildTokenTradeKeyboard } from "../src/bot/keyboards.js";
+import { escapeMd, formatWalletLeaderboardMessage, stripMdForFallback } from "../src/bot/formatters.js";
+import {
+  buildDetectiveKeyboard,
+  buildSettingsKeyboard,
+  buildTokenTradeKeyboard,
+  buildWatcherDetailKeyboard,
+  buildWatchersKeyboard
+} from "../src/bot/keyboards.js";
 import { ChainKey } from "../src/chains/registry.js";
 import { AdminDb } from "../src/db/adminDb.js";
 import { UserVaultManager } from "../src/db/userVault.js";
@@ -13,6 +19,7 @@ import { loadConfig } from "../src/config.js";
 import { CopyEngine } from "../src/services/copyEngine.js";
 import { EvmClientManager } from "../src/services/evmClients.js";
 import { MarketDataService, TokenSnapshot } from "../src/services/marketData.js";
+import { OrderMonitorService } from "../src/services/orderMonitor.js";
 import { PnlCardRenderer } from "../src/services/pnlCard.js";
 import { SecurityService, TokenSecurityReport } from "../src/services/security.js";
 import { SolanaClientManager } from "../src/services/solanaClient.js";
@@ -1075,16 +1082,265 @@ test("copyEngine copies brand-new unindexed PumpSwap buys via on-chain fallback 
 
     const parsedMintTx = await (
       watcher2 as unknown as {
-        inspectSolanaTx: (w: string, sig: string) => Promise<{ swaps: unknown[]; fetched: boolean }>;
+        inspectSolanaTx: (w: string, sig: string) => Promise<{ swaps: Array<{ isDevLaunch?: boolean }>; fetched: boolean }>;
       }
     ).inspectSolanaTx("CreatorWallet1111111111111111111111111111111", "sig_mint_create");
     assert.equal(parsedMintTx.fetched, true);
-    assert.equal(parsedMintTx.swaps.length, 0);
+    assert.equal(parsedMintTx.swaps.length, 1);
+    assert.equal(parsedMintTx.swaps[0].isDevLaunch, true);
+
+    // Ensure non-dev-sniping watcher ignores that dev launch safely without buying
+    await copy.processSwapForUser("999", watched, parsedMintTx.swaps[0] as never);
+    assert.equal((await vault.listOpenPositions()).length, 1);
 
     await adminDb2.close();
     await vaults.closeAll();
   } finally {
     globalThis.fetch = origFetch;
     fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+  }
+});
+
+test("dev-launch pool snipe, Option B SL, proportional sells, cross-wallet LP exit, leaderboard & callbacks", async () => {
+  const tmp = makeTempDir("degen-patches-");
+  const origFetch = globalThis.fetch;
+  try {
+    const config = loadConfig({ dataDir: tmp, heliusApiKey: "test_helius_key" });
+    const adminDb = new AdminDb(config.adminDbPath, 10);
+    await adminDb.redeemCode({ code: config.adminBootstrapCode, telegramId: "888", username: "devtester" });
+    const vaults = new UserVaultManager(config.userVaultDir);
+    const evm = new EvmClientManager(config);
+    const sol = new SolanaClientManager(config);
+
+    let liveSpotPrice = 0.000015;
+    let liveSpotLiq = 30_000;
+    let liveSpotMc = 15_000;
+
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("dexscreener.com")) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.includes("geckoterminal.com") || url.includes("pump.fun")) {
+        return new Response(JSON.stringify({}), { status: 404 });
+      }
+      if (url.includes("helius-rpc.com")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        const id = body?.params?.id;
+        if (id === "So11111111111111111111111111111111111111112") {
+          return new Response(
+            JSON.stringify({ result: { token_info: { price_info: { price_per_token: 75 } } } }),
+            { status: 200 }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            result: {
+              content: { metadata: { symbol: "LAUNCH", name: "Launch Coin" } },
+              token_info: { symbol: "LAUNCH", decimals: 6, supply: 1_000_000_000_000_000 }
+            }
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const market = new MarketDataService(config, evm, sol);
+    const sec = new SecurityService();
+    sec.checkToken = async () => makeSafeSecurity("solana");
+    const trading = new TradingEngine(market, sec);
+    const alerts: string[] = [];
+    const copy = new CopyEngine({
+      vaultManager: vaults,
+      market,
+      security: sec,
+      trading,
+      onNotify: async (_uid, msg) => {
+        alerts.push(msg);
+      },
+      snapshotRetryDelaysMs: [0]
+    });
+
+    const vault = await vaults.getVault("888");
+    await vault.setVirtualFunds("solana", parseExactUnits("2", 9));
+    await vault.setSetting("sim_delay_ms", "0");
+    await vault.setSetting("priority_fee_sol", "0");
+    await vault.setSetting("notify_skips", "1");
+
+    const devId = await vault.addWatchedWallet({
+      chain: "solana",
+      address: "DevSniperWallet11111111111111111111111111111",
+      alias: "$706k",
+      copyMode: "fixed",
+      copyAmountAtomic: parseExactUnits("0.1", 9),
+      snipeDevLaunches: true,
+      autoTpPct: 100,
+      autoSlPct: -50,
+      autoTrailingPct: 25,
+      simMode: "ideal",
+      blockRisky: false
+    });
+    const traderId = await vault.addWatchedWallet({
+      chain: "solana",
+      address: "PropTraderWallet111111111111111111111111111",
+      alias: "Refill",
+      copyMode: "fixed",
+      copyAmountAtomic: parseExactUnits("0.2", 9),
+      sellMode: "proportional",
+      mirrorSells: true,
+      autoSlPct: -50,
+      simMode: "ideal",
+      blockRisky: false
+    });
+    const devWallet = (await vault.getWatchedWallet(devId))!;
+    const traderWallet = (await vault.getWatchedWallet(traderId))!;
+
+    // 1. Dev seeds new pool: 200 SOL ($15,000) + 1B tokens -> real opening MC ~$15K (never $1.12)
+    await copy.processSwapForUser("888", devWallet, {
+      chain: "solana",
+      walletAddress: devWallet.address,
+      txHash: "sig_pool_seed",
+      side: "buy",
+      tokenAddress: "LaunchCoinMint111111111111111111111111111111",
+      walletNativeAmountAtomic: parseExactUnits("200", 9),
+      walletTokenAmount: 1_000_000_000,
+      isDevLaunch: true,
+      launchPoolSol: 200,
+      launchPoolTokens: 1_000_000_000,
+      dex: "pumpswap",
+      detectedAt: Date.now()
+    });
+
+    const openAfterLaunch = await vault.listOpenPositions();
+    assert.equal(openAfterLaunch.length, 1);
+    assert.ok(openAfterLaunch[0].entryMcUsd >= 14_000 && openAfterLaunch[0].entryMcUsd <= 16_000);
+    const activeOrders = await vault.listActiveOrders();
+    assert.deepEqual(
+      activeOrders.map((o) => o.orderType).sort(),
+      ["sl", "tp", "trailing_stop"]
+    );
+
+    // 2. Mock OrderMonitor snapshots: -30% dip with 75% lower liq does NOT exit early (Option B), then -55% SL triggers cleanly!
+    market.getBatchTokenSnapshots = async () =>
+      new Map([
+        [
+          "LaunchCoinMint111111111111111111111111111111",
+          makeFakeSnap({
+            address: "LaunchCoinMint111111111111111111111111111111",
+            symbol: "LAUNCH",
+            priceUsd: liveSpotPrice,
+            nativePriceUsd: 75,
+            mcUsd: liveSpotMc,
+            liquidityUsd: liveSpotLiq
+          })
+        ]
+      ]);
+    const monitor = new OrderMonitorService({
+      adminDb,
+      vaultManager: vaults,
+      market,
+      security: sec,
+      trading,
+      onNotify: async (_uid, msg) => {
+        alerts.push(msg);
+      }
+    });
+
+    // Normal -30% dip (even if liquidity fell sharply) leaves position open under Option B
+    liveSpotPrice = 0.0000105;
+    liveSpotMc = 10_500;
+    liveSpotLiq = 6_000;
+    await monitor.tick();
+    assert.equal((await vault.listOpenPositions()).length, 1);
+
+    // Hits -55% SL (past -50%) -> closes automatically via SL
+    liveSpotPrice = 0.0000067;
+    liveSpotMc = 6_700;
+    liveSpotLiq = 12_000;
+    await monitor.tick();
+    assert.equal((await vault.listOpenPositions()).length, 0);
+    assert.ok(alerts.some((a) => a.includes("Stop Loss") && a.includes("Triggered")));
+
+    // 3. Proportional copy sell (trader sells 25% -> only 25% of position is sold)
+    liveSpotPrice = 0.00002;
+    liveSpotMc = 20_000;
+    liveSpotLiq = 30_000;
+    market.getTokenSnapshot = async () =>
+      makeFakeSnap({
+        address: "RunnerCoinMint111111111111111111111111111111",
+        symbol: "RUNNER",
+        priceUsd: 0.00002,
+        nativePriceUsd: 75,
+        mcUsd: 20_000,
+        liquidityUsd: 30_000
+      });
+    await copy.processSwapForUser("888", traderWallet, {
+      chain: "solana",
+      walletAddress: traderWallet.address,
+      txHash: "sig_runner_buy",
+      side: "buy",
+      tokenAddress: "RunnerCoinMint111111111111111111111111111111",
+      walletNativeAmountAtomic: parseExactUnits("1", 9),
+      detectedAt: Date.now()
+    });
+    const beforePartial = (await vault.listOpenPositions())[0];
+    await copy.processSwapForUser("888", traderWallet, {
+      chain: "solana",
+      walletAddress: traderWallet.address,
+      txHash: "sig_runner_sell_25",
+      side: "sell",
+      tokenAddress: "RunnerCoinMint111111111111111111111111111111",
+      walletNativeAmountAtomic: parseExactUnits("0.3", 9),
+      walletSellPct: 25,
+      detectedAt: Date.now()
+    });
+    const afterPartial = (await vault.listOpenPositions())[0];
+    assert.ok(afterPartial);
+    assert.ok(afterPartial.qtyTokenAtomic < beforePartial.qtyTokenAtomic);
+    assert.ok(alerts.some((a) => a.includes("Instant Copy Sell (25%)")));
+
+    // 4. Cross-wallet danger exit when another watched dev wallet removes LP on RUNNER
+    await copy.handleCrossWalletDangerSell({
+      telegramId: "888",
+      triggerWalletAlias: "$706k",
+      triggerWalletId: devId,
+      chain: "solana",
+      tokenAddress: "RunnerCoinMint111111111111111111111111111111",
+      txHash: "sig_lp_pull",
+      reason: "removed pool liquidity"
+    });
+    assert.equal((await vault.listOpenPositions()).length, 0);
+    assert.ok(alerts.some((a) => a.includes("Cross-Wallet Exit Guard")));
+
+    // 5. Leaderboard & keyboard callback limits (<= 64B)
+    const closedAll = await vault.listClosedPositions(50);
+    const board = formatWalletLeaderboardMessage([devWallet, traderWallet], [], closedAll);
+    assert.ok(board.includes("Wallet Copy Leaderboard"));
+    assert.ok(board.includes("$706k"));
+
+    for (const kb of [
+      buildWatchersKeyboard([devWallet, traderWallet]),
+      buildWatcherDetailKeyboard(devWallet),
+      buildSettingsKeyboard(await vault.getSettings())
+    ]) {
+      for (const row of kb.inline_keyboard) {
+        for (const btn of row) {
+          if ("callback_data" in btn && btn.callback_data) {
+            assert.ok(Buffer.byteLength(btn.callback_data, "utf8") <= 64, `Too long: ${btn.callback_data}`);
+          }
+        }
+      }
+    }
+
+    await vaults.closeAll();
+    await adminDb.close();
+  } finally {
+    globalThis.fetch = origFetch;
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+    } catch {
+      // ignore Windows SQLite WAL file handle release delay
+    }
   }
 });

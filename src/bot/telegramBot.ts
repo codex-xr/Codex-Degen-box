@@ -37,6 +37,7 @@ import {
   formatHomeMessage,
   formatPositionMessage,
   formatTokenScanMessage,
+  formatWalletLeaderboardMessage,
   formatWatchedWalletMessage,
   shortChainCode,
   stripMdForFallback
@@ -1225,6 +1226,19 @@ export function createTelegramBot(services: BotServices): Bot {
         );
       }
 
+      if (parts[0] === "watch" && parts[1] === "board") {
+        const [wallets, openPos, closedPos] = await Promise.all([
+          vault.listWatchedWallets(false),
+          vault.listOpenPositions(),
+          vault.listClosedPositions(500)
+        ]);
+        return await safeEditOrReply(
+          ctx,
+          formatWalletLeaderboardMessage(wallets, openPos, closedPos),
+          buildWatchersKeyboard(wallets)
+        );
+      }
+
       if (parts[0] === "watch" && parts[1] === "view") {
         const w = await vault.getWatchedWallet(Number(parts[2]));
         if (!w) return await safeReply(ctx, "❌ Watched wallet not found.");
@@ -1241,6 +1255,14 @@ export function createTelegramBot(services: BotServices): Bot {
           await vault.updateWatchedWallet(id, { transferAlerts: !w.transferAlerts });
         }
         if (field === "mirrorSells") await vault.updateWatchedWallet(id, { mirrorSells: !w.mirrorSells });
+        if (field === "sellMode") {
+          await vault.updateWatchedWallet(id, {
+            sellMode: w.sellMode === "proportional" ? "full" : "proportional"
+          });
+        }
+        if (field === "snipeDevLaunches") {
+          await vault.updateWatchedWallet(id, { snipeDevLaunches: !w.snipeDevLaunches });
+        }
         if (field === "blockRisky") await vault.updateWatchedWallet(id, { blockRisky: !w.blockRisky });
         if (field === "skipIfHeld") await vault.updateWatchedWallet(id, { skipIfHeld: !w.skipIfHeld });
         if (field === "simMode") {
@@ -1282,12 +1304,18 @@ export function createTelegramBot(services: BotServices): Bot {
 
       if (parts[0] === "watch" && parts[1] === "filter") {
         const walletId = Number(parts[2]);
-        const field = parts[3] as "min_mc" | "max_mc" | "min_liq" | "tp_sl";
+        const field = parts[3] as "min_mc" | "max_mc" | "min_liq" | "tp_sl" | "trail";
         setPrompt(telegramId, { kind: "await_edit_watch_filter", walletId, field }, vault);
         if (field === "tp_sl") {
           return await safeReply(
             ctx,
-            "🎯 Send auto Take-Profit % and Stop-Loss % separated by space (e.g., `150 -40`), or `off` to clear:"
+            "🎯 Send auto Take-Profit % and Stop-Loss % separated by space (e.g., `100 -50`), or `off` to clear:"
+          );
+        }
+        if (field === "trail") {
+          return await safeReply(
+            ctx,
+            "📈 Send auto Trailing Stop-Loss drop % (e.g., `25` sells if price drops 25% from peak), or `off` to clear:"
           );
         }
         return await safeReply(
@@ -1526,6 +1554,8 @@ export function createTelegramBot(services: BotServices): Bot {
           await vault.setSetting("sim_mode", s.simMode === "realistic" ? "ideal" : "realistic");
         } else if (parts[2] === "copyNotify") {
           await vault.setSetting("copy_notify", s.copyNotify ? "0" : "1");
+        } else if (parts[2] === "notifySkips") {
+          await vault.setSetting("notify_skips", s.notifySkips ? "0" : "1");
         } else if (parts[2] === "weeklyReport") {
           await vault.setSetting("weekly_report_enabled", s.weeklyReportEnabled ? "0" : "1");
         } else if (parts[2] === "pnlHideAmounts") {
@@ -2110,6 +2140,16 @@ export function createTelegramBot(services: BotServices): Bot {
                 throw new Error("Example format: `150 -40` (positive TP, negative SL) or `off`");
               }
               await vault.updateWatchedWallet(w.id, { autoTpPct: tp, autoSlPct: sl });
+            }
+          } else if (pending.field === "trail") {
+            if (isOff) {
+              await vault.updateWatchedWallet(w.id, { autoTrailingPct: null });
+            } else {
+              const trail = Number(text.replace(/[%,\s]/g, ""));
+              if (!Number.isFinite(trail) || trail <= 0 || trail >= 100) {
+                throw new Error("Enter a percentage between 1 and 99 (e.g., `25`), or `off`.");
+              }
+              await vault.updateWatchedWallet(w.id, { autoTrailingPct: trail });
             }
           } else {
             const val = isOff ? null : Number(cleanDecimalInput(text));

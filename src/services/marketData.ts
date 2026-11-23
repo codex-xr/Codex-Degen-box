@@ -595,6 +595,77 @@ export class MarketDataService {
     return snap;
   }
 
+  /**
+   * Calculates exact opening pool MC & liquidity directly from a newly seeded PumpSwap / AMM pool's
+   * SOL + token reserves so dev-launch sniping enters at real launch price (never $1 mint fees).
+   */
+  async buildDevPoolLaunchSnapshot(params: {
+    tokenAddress: string;
+    poolSolAmount: number;
+    poolTokenAmount: number;
+    dex?: string;
+    pairAddress?: string;
+  }): Promise<TokenSnapshot | null> {
+    if (
+      !Number.isFinite(params.poolSolAmount) ||
+      params.poolSolAmount < 0.5 ||
+      !Number.isFinite(params.poolTokenAmount) ||
+      params.poolTokenAmount <= 0
+    ) {
+      return null;
+    }
+
+    const [assetMeta, nativePriceUsd] = await Promise.all([
+      this.fetchHeliusAssetMeta(params.tokenAddress),
+      this.getNativePriceUsd("solana")
+    ]);
+    if (nativePriceUsd <= 0) return null;
+
+    const decimals = assetMeta?.decimals ?? (await this.solanaClient.getTokenDecimals(params.tokenAddress));
+    const priceUsd = (params.poolSolAmount * nativePriceUsd) / params.poolTokenAmount;
+    if (!Number.isFinite(priceUsd) || priceUsd <= 0) return null;
+
+    const supplyTokens =
+      assetMeta && assetMeta.supplyAtomic > 0 ? assetMeta.supplyAtomic / 10 ** decimals : params.poolTokenAmount;
+    const mcUsd = priceUsd * supplyTokens;
+    if (!Number.isFinite(mcUsd) || mcUsd < 1500 || mcUsd > 10_000_000_000) return null;
+
+    const liquidityUsd = params.poolSolAmount * 2 * nativePriceUsd;
+    const now = Date.now();
+    const symbol = assetMeta?.symbol || "NEWLAUNCH";
+    const name = assetMeta?.name || symbol;
+    const snap: TokenSnapshot = {
+      chain: "solana",
+      address: params.tokenAddress,
+      symbol,
+      name,
+      decimals,
+      pairAddress: params.pairAddress || params.tokenAddress,
+      dex: params.dex || "pumpswap",
+      dexUrl: `https://solscan.io/token/${params.tokenAddress}`,
+      priceUsd,
+      priceNative: priceUsd / nativePriceUsd,
+      nativePriceUsd,
+      mcUsd,
+      fdvUsd: mcUsd,
+      liquidityUsd,
+      volume5mUsd: 0,
+      volume1hUsd: 0,
+      volume24hUsd: 0,
+      txns5mBuys: 1,
+      txns5mSells: 0,
+      priceChange5m: 0,
+      priceChange1h: 0,
+      priceChange24h: 0,
+      pairCreatedAtMs: now,
+      tokenAgeSec: 1,
+      imageUrl: null,
+      fetchedAt: now
+    };
+    this.snapshotCache.set(`solana:${params.tokenAddress}`, { snap, ts: now });
+    return snap;
+  }
+
   async getTokenSnapshot(
     chain: ChainKey,
     address: string,

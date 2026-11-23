@@ -15,6 +15,7 @@ import {
   PnlTheme,
   PositionRow,
   RedeemResult,
+  SellMode,
   SimMode,
   TradeRow,
   UserRole,
@@ -549,9 +550,12 @@ export class PostgresUserVault implements IUserVault {
         mirror_sells SMALLINT NOT NULL DEFAULT 1,
         block_risky SMALLINT NOT NULL DEFAULT 1,
         transfer_alerts SMALLINT NOT NULL DEFAULT 1,
+        snipe_dev_launches SMALLINT NOT NULL DEFAULT 0,
+        sell_mode TEXT NOT NULL DEFAULT 'full',
         sim_mode TEXT NOT NULL DEFAULT 'realistic',
         auto_tp_pct DOUBLE PRECISION,
         auto_sl_pct DOUBLE PRECISION,
+        auto_trailing_pct DOUBLE PRECISION,
         last_seen_tx TEXT,
         created_at BIGINT NOT NULL,
         UNIQUE(chain, address)
@@ -588,6 +592,9 @@ export class PostgresUserVault implements IUserVault {
       );
 
       ALTER TABLE ${s}.watched_wallets ADD COLUMN IF NOT EXISTS transfer_alerts SMALLINT NOT NULL DEFAULT 1;
+      ALTER TABLE ${s}.watched_wallets ADD COLUMN IF NOT EXISTS snipe_dev_launches SMALLINT NOT NULL DEFAULT 0;
+      ALTER TABLE ${s}.watched_wallets ADD COLUMN IF NOT EXISTS sell_mode TEXT NOT NULL DEFAULT 'full';
+      ALTER TABLE ${s}.watched_wallets ADD COLUMN IF NOT EXISTS auto_trailing_pct DOUBLE PRECISION;
       ALTER TABLE ${s}.virtual_balances ENABLE ROW LEVEL SECURITY;
       ALTER TABLE ${s}.user_settings ENABLE ROW LEVEL SECURITY;
       ALTER TABLE ${s}.positions ENABLE ROW LEVEL SECURITY;
@@ -616,7 +623,8 @@ export class PostgresUserVault implements IUserVault {
       sim_delay_ms: String(DEFAULT_USER_SETTINGS.simDelayMs),
       pnl_theme: DEFAULT_USER_SETTINGS.pnlTheme,
       weekly_report_enabled: DEFAULT_USER_SETTINGS.weeklyReportEnabled ? "1" : "0",
-      copy_notify: DEFAULT_USER_SETTINGS.copyNotify ? "1" : "0"
+      copy_notify: DEFAULT_USER_SETTINGS.copyNotify ? "1" : "0",
+      notify_skips: DEFAULT_USER_SETTINGS.notifySkips ? "1" : "0"
     };
     for (const [k, v] of Object.entries(defaults)) {
       await this.pool.query(
@@ -751,7 +759,8 @@ export class PostgresUserVault implements IUserVault {
       pnlHideAmounts: map.get("pnl_hide_amounts") === "1",
       hasPnlBg: map.get("pnl_bg_data_url") === "1",
       weeklyReportEnabled: (map.get("weekly_report_enabled") ?? "1") === "1",
-      copyNotify: (map.get("copy_notify") ?? "1") === "1"
+      copyNotify: (map.get("copy_notify") ?? "1") === "1",
+      notifySkips: map.get("notify_skips") === "1"
     };
   }
 
@@ -1131,8 +1140,8 @@ export class PostgresUserVault implements IUserVault {
       `INSERT INTO ${this.t("watched_wallets")} (
         chain, address, alias, enabled, copy_mode, copy_amount_atomic, copy_percent, max_buy_atomic,
         min_mc_usd, max_mc_usd, min_liq_usd, skip_if_held, mirror_sells, block_risky, transfer_alerts,
-        sim_mode, auto_tp_pct, auto_sl_pct, created_at
-      ) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        snipe_dev_launches, sell_mode, sim_mode, auto_tp_pct, auto_sl_pct, auto_trailing_pct, created_at
+      ) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
       RETURNING id`,
       [
         input.chain,
@@ -1149,9 +1158,12 @@ export class PostgresUserVault implements IUserVault {
         (input.mirrorSells ?? true) ? 1 : 0,
         (input.blockRisky ?? true) ? 1 : 0,
         (input.transferAlerts ?? true) ? 1 : 0,
+        (input.snipeDevLaunches ?? false) ? 1 : 0,
+        input.sellMode ?? "full",
         input.simMode ?? "realistic",
         input.autoTpPct ?? null,
         input.autoSlPct ?? null,
+        input.autoTrailingPct ?? null,
         now
       ]
     );
@@ -1185,9 +1197,10 @@ export class PostgresUserVault implements IUserVault {
       `UPDATE ${this.t("watched_wallets")} SET
         alias = $1, enabled = $2, copy_mode = $3, copy_amount_atomic = $4, copy_percent = $5,
         max_buy_atomic = $6, min_mc_usd = $7, max_mc_usd = $8, min_liq_usd = $9,
-        skip_if_held = $10, mirror_sells = $11, block_risky = $12, transfer_alerts = $13, sim_mode = $14,
-        auto_tp_pct = $15, auto_sl_pct = $16, last_seen_tx = $17
-       WHERE id = $18`,
+        skip_if_held = $10, mirror_sells = $11, block_risky = $12, transfer_alerts = $13,
+        snipe_dev_launches = $14, sell_mode = $15, sim_mode = $16,
+        auto_tp_pct = $17, auto_sl_pct = $18, auto_trailing_pct = $19, last_seen_tx = $20
+       WHERE id = $21`,
       [
         patch.alias ?? current.alias,
         (patch.enabled ?? current.enabled) ? 1 : 0,
@@ -1202,9 +1215,12 @@ export class PostgresUserVault implements IUserVault {
         (patch.mirrorSells ?? current.mirrorSells) ? 1 : 0,
         (patch.blockRisky ?? current.blockRisky) ? 1 : 0,
         (patch.transferAlerts ?? current.transferAlerts) ? 1 : 0,
+        (patch.snipeDevLaunches ?? current.snipeDevLaunches) ? 1 : 0,
+        patch.sellMode ?? current.sellMode,
         patch.simMode ?? current.simMode,
         patch.autoTpPct !== undefined ? patch.autoTpPct : current.autoTpPct,
         patch.autoSlPct !== undefined ? patch.autoSlPct : current.autoSlPct,
+        patch.autoTrailingPct !== undefined ? patch.autoTrailingPct : current.autoTrailingPct,
         patch.lastSeenTx !== undefined ? patch.lastSeenTx : current.lastSeenTx,
         id
       ]
@@ -1406,9 +1422,15 @@ export class PostgresUserVault implements IUserVault {
       mirrorSells: Number(row.mirror_sells) === 1,
       blockRisky: Number(row.block_risky) === 1,
       transferAlerts: row.transfer_alerts === null || row.transfer_alerts === undefined ? true : Number(row.transfer_alerts) === 1,
+      snipeDevLaunches: Number(row.snipe_dev_launches ?? 0) === 1,
+      sellMode: (row.sell_mode ? String(row.sell_mode) : "full") as SellMode,
       simMode: String(row.sim_mode) as SimMode,
       autoTpPct: row.auto_tp_pct !== null && row.auto_tp_pct !== undefined ? Number(row.auto_tp_pct) : null,
       autoSlPct: row.auto_sl_pct !== null && row.auto_sl_pct !== undefined ? Number(row.auto_sl_pct) : null,
+      autoTrailingPct:
+        row.auto_trailing_pct !== null && row.auto_trailing_pct !== undefined
+          ? Number(row.auto_trailing_pct)
+          : null,
       lastSeenTx: row.last_seen_tx ? String(row.last_seen_tx) : null,
       createdAt: Number(row.created_at)
     };

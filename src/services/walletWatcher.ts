@@ -331,6 +331,9 @@ export class WalletWatcherService {
       this.markSeen(dedupKey);
 
       for (const swap of outcome.swaps) {
+        if (swap.side === "sell" && swap.walletSellPct === undefined) {
+          swap.walletSellPct = await this.estimateSolanaSellPct(walletAddress, swap.tokenAddress, swap.walletTokenAmount);
+        }
         await this.dispatchSwap(swap);
       }
       if (outcome.swaps.length === 0 && outcome.transfer) {
@@ -384,20 +387,38 @@ export class WalletWatcherService {
           }>;
           const tx = txs[0];
           if (tx) {
-            // Skip token mint / creator deploy transactions so mint-to-self never fakes a $1 MC copy-buy
-            const isMintCreationTx =
-              tx.type === "TOKEN_MINT" ||
-              tx.type === "CREATE" ||
-              tx.type === "INITIALIZE_MINT" ||
-              (tx.tokenTransfers ?? []).some(
-                (t) => !t.fromUserAccount && t.toUserAccount === walletAddress && !isQuote(t.mint ?? "")
-              );
-            if (isMintCreationTx) {
-              return { swaps: [], fetched: true };
-            }
-
+            const mintedTransfer = (tx.tokenTransfers ?? []).find(
+              (t) => !t.fromUserAccount && t.toUserAccount === walletAddress && t.mint && !isQuote(t.mint)
+            );
             const parsed = this.extractSwapsFromHeliusTx(walletAddress, signature, tx);
             if (parsed.length > 0) return { swaps: parsed, fetched: true };
+
+            if (
+              mintedTransfer?.mint ||
+              tx.type === "TOKEN_MINT" ||
+              tx.type === "CREATE" ||
+              tx.type === "INITIALIZE_MINT"
+            ) {
+              if (mintedTransfer?.mint) {
+                return {
+                  swaps: [
+                    {
+                      chain: "solana",
+                      walletAddress,
+                      txHash: signature,
+                      side: "buy",
+                      tokenAddress: mintedTransfer.mint,
+                      walletNativeAmountAtomic: null,
+                      isDevLaunch: true,
+                      dex: tx.source,
+                      detectedAt: Date.now()
+                    }
+                  ],
+                  fetched: true
+                };
+              }
+              return { swaps: [], fetched: true };
+            }
 
             const hasNonQuoteTokenMove = (tx.tokenTransfers ?? []).some(
               (t) =>
@@ -588,6 +609,57 @@ export class WalletWatcherService {
     const swapEv = tx.events?.swap;
     const swaps: DetectedWalletSwap[] = [];
 
+    const wsolOut = tokenOut.get(wsol) ?? 0;
+    const wsolIn = tokenIn.get(wsol) ?? 0;
+    const solOutTotal = nativeOutLamports / 1e9 + wsolOut;
+    const solInTotal = nativeInLamports / 1e9 + wsolIn;
+
+    // 1. Liquidity Pool Seed / Creation: dev sends BOTH >=0.5 SOL/WSOL and large token supply out
+    if (
+      !swapEv &&
+      tx.type !== "SWAP" &&
+      soldToken &&
+      soldToken[1] >= 10_000 &&
+      solOutTotal >= 0.5 &&
+      solInTotal < 0.2
+    ) {
+      return [
+        {
+          chain: "solana",
+          walletAddress,
+          txHash: signature,
+          side: "buy",
+          tokenAddress: soldToken[0],
+          walletNativeAmountAtomic: BigInt(Math.round(solOutTotal * 1e9)),
+          walletTokenAmount: soldToken[1],
+          isDevLaunch: true,
+          launchPoolSol: solOutTotal,
+          launchPoolTokens: soldToken[1],
+          dex: tx.source || "pumpswap",
+          detectedAt: Date.now()
+        }
+      ];
+    }
+
+    // 2. LP Removal / Rug withdrawal: wallet receives BOTH >=0.5 SOL/WSOL and non-quote tokens
+    if (!swapEv && tx.type !== "SWAP" && boughtToken && solInTotal >= 0.5 && solOutTotal < 0.2) {
+      return [
+        {
+          chain: "solana",
+          walletAddress,
+          txHash: signature,
+          side: "sell",
+          tokenAddress: boughtToken[0],
+          walletNativeAmountAtomic: BigInt(Math.round(solInTotal * 1e9)),
+          walletTokenAmount: boughtToken[1],
+          walletSellPct: 100,
+          isLpRemoval: true,
+          dex: tx.source || "pumpswap",
+          detectedAt: Date.now()
+        }
+      ];
+    }
+
     if (
       soldToken &&
       (swapEv || tx.type === "SWAP" || hasQuoteMove || Boolean(boughtToken) || nativeInLamports >= 500_000)
@@ -700,6 +772,9 @@ export class WalletWatcherService {
 
     const swaps: DetectedWalletSwap[] = [];
     if (soldMint && (solDelta > 100_000n || quoteGained || boughtMint !== null)) {
+      const preAmt = preMap.get(soldMint) ?? 0n;
+      const sellPct =
+        preAmt > 0n ? Math.max(1, Math.min(100, Math.round((Number(soldAtomic) * 100) / Number(preAmt)))) : 100;
       swaps.push({
         chain: "solana",
         walletAddress,
@@ -708,6 +783,7 @@ export class WalletWatcherService {
         tokenAddress: soldMint,
         walletNativeAmountAtomic: solDelta > 0n ? solDelta : null,
         walletTokenAmount: atomicToNumber(soldAtomic, decMap.get(soldMint) ?? 6),
+        walletSellPct: sellPct,
         detectedAt: Date.now()
       });
     }
@@ -1007,6 +1083,33 @@ export class WalletWatcherService {
     }
   }
 
+  private async estimateSolanaSellPct(
+    walletAddress: string,
+    mint: string,
+    soldAmount?: number
+  ): Promise<number> {
+    if (!soldAmount || soldAmount <= 0) return 100;
+    const key = `solana:${normalizeAddress("solana", walletAddress)}`;
+    const watchers = this.targets.get(key) ?? [];
+    if (!watchers.some((t) => t.wallet.sellMode === "proportional")) {
+      return 100;
+    }
+    try {
+      const res = await this.solanaRpcSingle<{
+        value?: Array<{ account?: { data?: { parsed?: { info?: { tokenAmount?: { uiAmount?: number } } } } } }>;
+      }>("getTokenAccountsByOwner", [walletAddress, { mint }, { encoding: "jsonParsed" }]);
+      const remaining = (res?.value ?? []).reduce(
+        (acc, item) => acc + Number(item.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0),
+        0
+      );
+      const totalBefore = soldAmount + remaining;
+      if (totalBefore <= 0) return 100;
+      return Math.max(1, Math.min(100, Math.round((soldAmount / totalBefore) * 100)));
+    } catch {
+      return 100;
+    }
+  }
+
   private async dispatchSwap(swap: DetectedWalletSwap): Promise<void> {
     const key = `${swap.chain}:${normalizeAddress(swap.chain, swap.walletAddress)}`;
     const watchers = this.targets.get(key);
@@ -1015,6 +1118,24 @@ export class WalletWatcherService {
     await Promise.all(
       watchers.map((w) => this.copyEngine.processSwapForUser(w.telegramId, w.wallet, swap))
     );
+
+    // Cross-Wallet Danger Exit: if a watched dev/LP wallet removes LP or dev-sells, protect user's other copy bags
+    if (swap.side === "sell" && (swap.isLpRemoval || watchers.some((w) => w.wallet.snipeDevLaunches))) {
+      const reason = swap.isLpRemoval ? "removed pool liquidity" : "dev-sold this token";
+      await Promise.all(
+        watchers.map((w) =>
+          this.copyEngine.handleCrossWalletDangerSell({
+            telegramId: w.telegramId,
+            triggerWalletAlias: w.wallet.alias,
+            triggerWalletId: w.wallet.id,
+            chain: swap.chain,
+            tokenAddress: swap.tokenAddress,
+            txHash: swap.txHash,
+            reason
+          })
+        )
+      );
+    }
   }
 
   private async dispatchTransfer(transfer: DetectedWalletTransfer): Promise<void> {

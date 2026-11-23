@@ -4,6 +4,7 @@ export type UserRole = "admin" | "member";
 export type SimMode = "realistic" | "ideal";
 export type PnlTheme = "cyber" | "solana" | "robinhood" | "gold";
 export type CopyMode = "fixed" | "percent_balance";
+export type SellMode = "full" | "proportional";
 
 export interface AuthorizedUser {
   telegramId: string;
@@ -51,6 +52,7 @@ export interface UserSettings {
   hasPnlBg: boolean;
   weeklyReportEnabled: boolean;
   copyNotify: boolean;
+  notifySkips: boolean;
 }
 
 export interface PositionRow {
@@ -154,9 +156,12 @@ export interface WatchedWalletRow {
   mirrorSells: boolean;
   blockRisky: boolean;
   transferAlerts: boolean;
+  snipeDevLaunches: boolean;
+  sellMode: SellMode;
   simMode: SimMode;
   autoTpPct: number | null;
   autoSlPct: number | null;
+  autoTrailingPct: number | null;
   lastSeenTx: string | null;
   createdAt: number;
 }
@@ -301,9 +306,12 @@ export interface IUserVault {
     mirrorSells?: boolean;
     blockRisky?: boolean;
     transferAlerts?: boolean;
+    snipeDevLaunches?: boolean;
+    sellMode?: SellMode;
     simMode?: SimMode;
     autoTpPct?: number | null;
     autoSlPct?: number | null;
+    autoTrailingPct?: number | null;
   }): Promise<number>;
   listWatchedWallets(onlyEnabled?: boolean): Promise<WatchedWalletRow[]>;
   getWatchedWallet(id: number): Promise<WatchedWalletRow | null>;
@@ -323,9 +331,12 @@ export interface IUserVault {
       mirrorSells: boolean;
       blockRisky: boolean;
       transferAlerts: boolean;
+      snipeDevLaunches: boolean;
+      sellMode: SellMode;
       simMode: SimMode;
       autoTpPct: number | null;
       autoSlPct: number | null;
+      autoTrailingPct: number | null;
       lastSeenTx: string | null;
     }>
   ): Promise<void>;
@@ -354,5 +365,6 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   pnlHideAmounts: false,
   hasPnlBg: false,
   weeklyReportEnabled: true,
-  copyNotify: true
+  copyNotify: true,
+  notifySkips: false
 };

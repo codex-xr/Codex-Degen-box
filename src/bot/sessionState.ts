@@ -17,7 +17,7 @@ export type PendingPrompt =
   | { kind: "await_watch_amount"; chain: ChainKey; address: string; alias: string }
   | { kind: "await_rename_watch"; walletId: number }
   | { kind: "await_edit_watch_amount"; walletId: number }
-  | { kind: "await_edit_watch_filter"; walletId: number; field: "min_mc" | "max_mc" | "min_liq" | "tp_sl" }
+  | { kind: "await_edit_watch_filter"; walletId: number; field: "min_mc" | "max_mc" | "min_liq" | "tp_sl" | "trail" }
   | { kind: "await_slippage" }
   | { kind: "await_gas_fee"; chain: ChainKey }
   | { kind: "await_pnl_bg" }

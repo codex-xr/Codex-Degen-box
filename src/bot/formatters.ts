@@ -202,7 +202,10 @@ export function formatWatchedWalletMessage(w: WatchedWalletRow): string {
     "",
     `💵 *Copy Size:* \`${copyAmtStr}\``,
     `🚨 Funding / Transfer Alerts: *${w.transferAlerts ? "Yes" : "No"}*`,
-    `🔁 Mirror Sells: *${w.mirrorSells ? "Yes" : "No"}*`,
+    `🔁 Mirror Sells: *${w.mirrorSells ? "Yes" : "No"}* (${
+      w.sellMode === "proportional" ? "Match Wallet Sell %" : "Full 100% Exit"
+    })`,
+    `🚀 Snipe Dev Launches: *${w.snipeDevLaunches ? "ON (Real Opening Pool MC)" : "Off"}*`,
     `🛡️ Block Risky/Honeypots: *${w.blockRisky ? "Yes" : "No"}*`,
     `⚡ Skip If Already Holding: *${w.skipIfHeld ? "Yes" : "No"}*`,
     `⏱️ Sim Mode: *${w.simMode === "realistic" ? "Realistic Delay" : "Instant Ideal"}*`,
@@ -214,8 +217,75 @@ export function formatWatchedWalletMessage(w: WatchedWalletRow): string {
     `• Min Liquidity: ${w.minLiqUsd !== null ? formatUsd(w.minLiqUsd) : "Any"}`,
     `• Auto TP / SL: ${w.autoTpPct !== null ? `+${w.autoTpPct}%` : "Off"} / ${
       w.autoSlPct !== null ? `${w.autoSlPct}%` : "Off"
-    }`
+    }  |  Trailing: ${w.autoTrailingPct !== null ? `${w.autoTrailingPct}%` : "Off"}`
   ];
+
+  return lines.join("\n");
+}
+
+export function formatWalletLeaderboardMessage(
+  wallets: WatchedWalletRow[],
+  openPositions: PositionRow[],
+  closedPositions: PositionRow[]
+): string {
+  if (wallets.length === 0) {
+    return "🏆 *Wallet Copy Leaderboard*\n\n_No watched wallets yet — add one under Watch Wallets!_";
+  }
+
+  const allCopyPos = [...openPositions, ...closedPositions].filter(
+    (p) => p.sourceType === "copy" && p.copiedWalletId !== null
+  );
+
+  const stats = wallets.map((w) => {
+    const mine = allCopyPos.filter((p) => p.copiedWalletId === w.id);
+    let wins = 0;
+    let losses = 0;
+    let rugs = 0;
+    let investedUsd = 0;
+    let totalPnlUsd = 0;
+
+    for (const p of mine) {
+      const inv = p.initialCostUsd > 0 ? p.initialCostUsd : p.costUsd;
+      investedUsd += inv;
+      if (p.status === "rugged") {
+        rugs++;
+        losses++;
+        totalPnlUsd += p.realizedUsd - inv;
+      } else if (p.status === "closed") {
+        const pnl = p.realizedUsd - inv;
+        totalPnlUsd += pnl;
+        if (pnl >= 0) wins++;
+        else losses++;
+      } else {
+        const markRatio = p.entryPriceUsd > 0 ? p.lastPriceUsd / p.entryPriceUsd : 1;
+        const openValUsd = p.costUsd * Math.max(0, markRatio);
+        totalPnlUsd += p.realizedUsd + openValUsd - inv;
+      }
+    }
+
+    const settled = wins + losses;
+    const winRate = settled > 0 ? (wins / settled) * 100 : 0;
+    const roi = investedUsd > 0 ? (totalPnlUsd / investedUsd) * 100 : 0;
+    return { w, trades: mine.length, wins, losses, rugs, investedUsd, totalPnlUsd, winRate, roi };
+  });
+
+  stats.sort((a, b) => b.totalPnlUsd - a.totalPnlUsd);
+
+  const lines = [
+    "🏆 *Wallet Copy Leaderboard*",
+    "_Ranked by real PnL from copied positions (wins, losses & rugs):_",
+    ""
+  ];
+  stats.forEach((s, idx) => {
+    const medal = idx === 0 ? "🥇" : idx === 1 ? "🥈" : idx === 2 ? "🥉" : "•";
+    const sign = s.totalPnlUsd >= 0 ? "+" : "";
+    const spec = CHAINS[s.w.chain];
+    lines.push(
+      `${medal} *${escapeMd(s.w.alias)}* (${spec.shortBadge})` +
+        `\n   PnL: *${sign}${formatUsd(s.totalPnlUsd)}* (${signedPct(s.roi)})` +
+        ` • Trades: *${s.trades}* (${s.wins}W / ${s.losses}L${s.rugs > 0 ? ` / ${s.rugs}💀` : ""}) • WR: *${s.winRate.toFixed(0)}%*`
+    );
+  });
 
   return lines.join("\n");
 }
