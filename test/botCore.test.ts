@@ -1106,8 +1106,9 @@ test("dev-launch pool snipe, Option B SL, proportional sells, cross-wallet LP ex
   const origFetch = globalThis.fetch;
   try {
     const config = loadConfig({ dataDir: tmp, heliusApiKey: "test_helius_key" });
-    const adminDb = new AdminDb(config.adminDbPath, 10);
-    await adminDb.redeemCode({ code: config.adminBootstrapCode, telegramId: "888", username: "devtester" });
+    const adminDb = new AdminDb(config.adminDbPath, 10, "BOOT-TEST");
+    const authRes = await adminDb.redeemCode({ code: "BOOT-TEST", telegramId: "888", username: "devtester" });
+    assert.equal(authRes.ok, true);
     const vaults = new UserVaultManager(config.userVaultDir);
     const evm = new EvmClientManager(config);
     const sol = new SolanaClientManager(config);
@@ -1220,6 +1221,9 @@ test("dev-launch pool snipe, Option B SL, proportional sells, cross-wallet LP ex
       activeOrders.map((o) => o.orderType).sort(),
       ["sl", "tp", "trailing_stop"]
     );
+    // Disable trailing stop on this specific SL test position so Option B -30% dip tests SL isolation cleanly
+    const trailOrd = activeOrders.find((o) => o.orderType === "trailing_stop");
+    if (trailOrd) await vault.setOrderStatus(trailOrd.id, "cancelled");
 
     // 2. Mock OrderMonitor snapshots: -30% dip with 75% lower liq does NOT exit early (Option B), then -55% SL triggers cleanly!
     market.getBatchTokenSnapshots = async () =>
