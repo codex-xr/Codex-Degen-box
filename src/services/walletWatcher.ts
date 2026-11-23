@@ -66,6 +66,10 @@ export class WalletWatcherService {
   private readonly solanaClient: SolanaClientManager;
   private readonly copyEngine: CopyEngine;
   private readonly onTransferAlert?: TransferAlertCallback;
+  private readonly onTelegramWebhook?: (
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ) => void;
 
   // Map key = `${chain}:${normalizedAddress}` -> list of user watchers
   private targets = new Map<string, WatcherTarget[]>();
@@ -89,6 +93,7 @@ export class WalletWatcherService {
     solanaClient: SolanaClientManager;
     copyEngine: CopyEngine;
     onTransferAlert?: TransferAlertCallback;
+    onTelegramWebhook?: (req: http.IncomingMessage, res: http.ServerResponse) => void;
   }) {
     this.config = params.config;
     this.adminDb = params.adminDb;
@@ -97,9 +102,13 @@ export class WalletWatcherService {
     this.solanaClient = params.solanaClient;
     this.copyEngine = params.copyEngine;
     this.onTransferAlert = params.onTransferAlert;
+    this.onTelegramWebhook = params.onTelegramWebhook;
   }
 
   async start(): Promise<void> {
+    // Bind HTTP health/webhook server immediately so Render healthchecks & wake-up webhooks pass fast
+    this.startWebhookServer();
+
     await this.reloadWatchers();
 
     // EVM block-level Swap + Transfer scanner for Base & Robinhood Chain
@@ -111,8 +120,6 @@ export class WalletWatcherService {
     this.solanaPollTimer = setInterval(() => {
       void this.pollSolanaFallback();
     }, this.config.solanaFallbackPollMs);
-
-    this.startWebhookServer();
   }
 
   async stop(): Promise<void> {
@@ -988,15 +995,27 @@ export class WalletWatcherService {
     if (!this.config.webhookPort) return;
     try {
       this.webhookServer = http.createServer((req, res) => {
-        if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
+        const reqPath = (req.url ?? "/").split("?")[0];
+        if ((req.method === "GET" || req.method === "HEAD") && (reqPath === "/" || reqPath === "/health")) {
           // Light DB heartbeat ensures both Render and Supabase Free stay awake on keep-alive pings
-          void this.adminDb.ping().then((dbOk) => {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ok: true, db: dbOk, service: "codex-degen-box" }));
-          });
+          void this.adminDb
+            .ping()
+            .catch(() => false)
+            .then((dbOk) => {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(
+                req.method === "HEAD"
+                  ? undefined
+                  : JSON.stringify({ ok: true, db: dbOk, service: "codex-degen-box" })
+              );
+            });
           return;
         }
-        if (req.method !== "POST" || req.url !== "/helius-webhook") {
+        if (req.method === "POST" && reqPath === "/telegram-webhook" && this.onTelegramWebhook) {
+          this.onTelegramWebhook(req, res);
+          return;
+        }
+        if (req.method !== "POST" || reqPath !== "/helius-webhook") {
           res.writeHead(404).end("Not found");
           return;
         }

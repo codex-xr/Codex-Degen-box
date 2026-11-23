@@ -1,4 +1,6 @@
-import { InlineKeyboard, InputFile } from "grammy";
+import crypto from "node:crypto";
+import http from "node:http";
+import { InlineKeyboard, InputFile, webhookCallback } from "grammy";
 import { CHAINS, shortAddress } from "./chains/registry.js";
 import { loadConfig } from "./config.js";
 import { AdminDb } from "./db/adminDb.js";
@@ -145,6 +147,37 @@ async function main(): Promise<void> {
     }
   };
 
+  process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled promise rejection (kept alive):", reason);
+  });
+  process.on("uncaughtException", (err) => {
+    const msg = err?.message ?? String(err);
+    if (/ECONNRESET|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|socket hang up|WebSocket/i.test(msg)) {
+      console.error("Transient socket/WS error (kept alive):", msg);
+      return;
+    }
+    console.error("Uncaught exception:", err);
+    process.exit(1);
+  });
+
+  const externalBaseUrl = (
+    process.env.TELEGRAM_WEBHOOK_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    ""
+  )
+    .trim()
+    .replace(/\/+$/, "");
+  const useTelegramWebhook = /^https:\/\/.+/.test(externalBaseUrl);
+  const tgWebhookSecret = crypto
+    .createHmac("sha256", config.botToken)
+    .update("evilfun-tg-webhook")
+    .digest("hex")
+    .slice(0, 32);
+
+  let tgWebhookHandler:
+    | ((req: http.IncomingMessage, res: http.ServerResponse) => Promise<void> | void)
+    | null = null;
+
   const copyEngine = new CopyEngine({
     vaultManager,
     market,
@@ -160,6 +193,16 @@ async function main(): Promise<void> {
     evmClients,
     solanaClient,
     copyEngine,
+    onTelegramWebhook: (req, res) => {
+      if (!tgWebhookHandler) {
+        res.writeHead(503).end("Starting");
+        return;
+      }
+      void Promise.resolve(tgWebhookHandler(req, res)).catch((err) => {
+        console.error("Telegram webhook handler error:", err);
+        if (!res.headersSent) res.writeHead(200).end("OK");
+      });
+    },
     onTransferAlert: async (telegramId, wallet, transfer) => {
       if (!botInstance) return;
       const spec = CHAINS[transfer.chain];
@@ -213,6 +256,14 @@ async function main(): Promise<void> {
     walletWatcher
   });
 
+  if (useTelegramWebhook) {
+    tgWebhookHandler = webhookCallback(botInstance, "http", {
+      secretToken: tgWebhookSecret,
+      onTimeout: "return",
+      timeoutMilliseconds: 25_000
+    });
+  }
+
   await botInstance.api
     .setMyCommands([
       { command: "start", description: "Start bot / Enter invite code" },
@@ -235,12 +286,15 @@ async function main(): Promise<void> {
     await notifyUser(telegramId, reportText);
   });
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log("Shutting down Evil.fun...");
     orderMonitor.stop();
     weeklyReports.stopScheduler();
     await walletWatcher.stop();
-    await botInstance?.stop();
+    await botInstance?.stop().catch(() => {});
     await vaultManager.closeAll();
     await adminDb.close();
     if (closePgPool) await closePgPool();
@@ -250,8 +304,42 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());
 
-  console.log("Evil.fun is live! Listening for Telegram updates...");
-  await botInstance.start();
+  if (useTelegramWebhook) {
+    const webhookUrl = `${externalBaseUrl}/telegram-webhook`;
+    let registered = false;
+    for (let attempt = 1; attempt <= 5 && !shuttingDown; attempt++) {
+      try {
+        await botInstance.init();
+        await botInstance.api.setWebhook(webhookUrl, {
+          secret_token: tgWebhookSecret,
+          drop_pending_updates: false
+        });
+        registered = true;
+        console.log(`Evil.fun is live in webhook mode: ${webhookUrl}`);
+        break;
+      } catch (err) {
+        console.error(`Telegram webhook registration attempt ${attempt} failed:`, err);
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
+      }
+    }
+    if (!registered && !shuttingDown) {
+      console.error("Failed to register Telegram webhook after retries; falling back to polling.");
+    } else {
+      return;
+    }
+  }
+
+  console.log("Evil.fun is live! Listening for Telegram updates (polling)...");
+  while (!shuttingDown) {
+    try {
+      await botInstance.start({ drop_pending_updates: false });
+      break;
+    } catch (err) {
+      if (shuttingDown) break;
+      console.error("Telegram polling error (retrying in 5s):", err);
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
 }
 
 main().catch((err) => {

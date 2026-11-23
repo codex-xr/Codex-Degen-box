@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -769,6 +770,94 @@ test("walletWatcher retries after transient RPC failures and detects coin-to-coi
     await vaults.closeAll();
     await adminDb.close();
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+    } catch {
+      // ignore Windows SQLite WAL handle
+    }
+  }
+});
+
+test("walletWatcher HTTP server handles GET/HEAD health safely and routes /telegram-webhook", async () => {
+  const tmp = makeTempDir("degen-http-");
+  const freePort = await new Promise<number>((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      srv.close((err) => (err ? reject(err) : resolve(port)));
+    });
+  });
+
+  try {
+    const config = loadConfig({
+      dataDir: tmp,
+      webhookPort: freePort,
+      evmPollMs: 600_000,
+      solanaFallbackPollMs: 600_000
+    });
+    const adminDb = new AdminDb(config.adminDbPath, 10);
+    adminDb.ping = async () => {
+      throw new Error("Simulated transient DB failure");
+    };
+    const vaults = new UserVaultManager(config.userVaultDir);
+    const evm = new EvmClientManager(config);
+    const sol = new SolanaClientManager(config);
+    const market = new MarketDataService(config, evm, sol);
+    const sec = new SecurityService();
+    const trading = new TradingEngine(market, sec);
+    const copy = new CopyEngine({
+      vaultManager: vaults,
+      market,
+      security: sec,
+      trading,
+      onNotify: async () => {}
+    });
+
+    let webhookHit = false;
+    const watcher = new WalletWatcherService({
+      config,
+      adminDb,
+      vaultManager: vaults,
+      evmClients: evm,
+      solanaClient: sol,
+      copyEngine: copy,
+      onTelegramWebhook: (req, res) => {
+        webhookHit = true;
+        req.resume();
+        res.writeHead(200).end("TG_OK");
+      }
+    });
+
+    await watcher.start();
+    // Wait briefly for server socket bind
+    await new Promise((r) => setTimeout(r, 80));
+
+    const getRes = await fetch(`http://127.0.0.1:${freePort}/health?ping=1`);
+    assert.equal(getRes.status, 200);
+    const json = (await getRes.json()) as { ok: boolean; db: boolean };
+    assert.equal(json.ok, true);
+    assert.equal(json.db, false);
+
+    const headRes = await fetch(`http://127.0.0.1:${freePort}/`, { method: "HEAD" });
+    assert.equal(headRes.status, 200);
+
+    const tgRes = await fetch(`http://127.0.0.1:${freePort}/telegram-webhook`, {
+      method: "POST",
+      body: JSON.stringify({ update_id: 1 })
+    });
+    assert.equal(tgRes.status, 200);
+    assert.equal(await tgRes.text(), "TG_OK");
+    assert.equal(webhookHit, true);
+
+    await watcher.stop();
+    await vaults.closeAll();
+    await adminDb.close();
+  } finally {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+    } catch {
+      // ignore Windows SQLite WAL handle
+    }
   }
 });

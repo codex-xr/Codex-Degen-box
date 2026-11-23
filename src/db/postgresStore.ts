@@ -31,13 +31,18 @@ export function createPgPool(databaseUrl: string): Pool {
     databaseUrl.includes("supabase.") ||
     databaseUrl.includes("pooler.") ||
     databaseUrl.includes("sslmode=require");
-  return new Pool({
+  const pool = new Pool({
     connectionString: databaseUrl,
     max: 8,
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 10_000,
+    keepAlive: true,
     ssl: needsSsl ? { rejectUnauthorized: false } : undefined
   });
+  pool.on("error", (err) => {
+    console.error("Postgres pool idle client error (non-fatal):", err.message);
+  });
+  return pool;
 }
 
 async function runQuery<T extends QueryResultRow = QueryResultRow>(
