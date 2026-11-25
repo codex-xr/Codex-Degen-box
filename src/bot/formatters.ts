@@ -13,7 +13,8 @@ import {
   formatCompactPrice,
   formatDuration,
   formatExactUnits,
-  formatUsd
+  formatUsd,
+  nativeAtomicToUsd
 } from "../utils/amounts.js";
 
 export function escapeMd(text: string): string {
@@ -120,7 +121,9 @@ export function formatTokenScanMessage(
   }
 
   lines.push("");
-  lines.push(`💰 Your ${spec.shortBadge} Balance: \`${balStr} ${spec.nativeSymbol}\``);
+  const balUsd = nativeAtomicToUsd(balanceAtomic, spec.nativeDecimals, snap.nativePriceUsd);
+  const balUsdHint = snap.nativePriceUsd > 0 ? ` (~*${formatUsd(balUsd)} USDT*)` : "";
+  lines.push(`💰 Your ${spec.shortBadge} Balance: \`${balStr} ${spec.nativeSymbol}\`${balUsdHint}`);
   lines.push(
     `[Explorer](${explorerTokenUrl(snap.chain, snap.address)})${
       snap.dexUrl ? ` • [DexScreener](${snap.dexUrl})` : ""

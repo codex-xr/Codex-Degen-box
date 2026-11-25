@@ -93,6 +93,67 @@ export function usdToNativeAtomic(
   return (usdScaled * nativeScale) / priceScaled;
 }
 
+export interface ParsedSpendInput {
+  isUsd: boolean;
+  usdAmount: number | null;
+  nativeAmountAtomic: bigint;
+}
+
+/**
+ * Returns true when user text explicitly specifies a USD/USDT amount (e.g. "$50", "50$", "25 usdt", "100 usd").
+ */
+export function isExplicitUsdInput(raw: string): boolean {
+  const trimmed = raw.trim();
+  return /^\$|\$$|(?:^|\d|\s)usdt?$/i.test(trimmed);
+}
+
+/**
+ * Parses either a native token amount (e.g. "0.5", "0.5 SOL") or a USD/USDT amount
+ * (e.g. "$50", "50 usdt", or "50" when forceUsd is true) into exact native atomic units.
+ */
+export function parseNativeOrUsdInput(params: {
+  raw: string;
+  nativeDecimals: number;
+  nativeSymbol: string;
+  nativePriceUsd?: number;
+  forceUsd?: boolean;
+}): ParsedSpendInput {
+  const trimmed = params.raw.trim().replace(/,/g, "");
+  const hasUsdMarker = isExplicitUsdInput(trimmed);
+  const isUsd = Boolean(params.forceUsd || hasUsdMarker);
+
+  if (isUsd) {
+    const cleanedUsd = trimmed
+      .replace(/^\$\s*/, "")
+      .replace(/\s*\$$/, "")
+      .replace(/\s*usdt?$/i, "")
+      .trim();
+    if (!/^\d+(\.\d+)?$/.test(cleanedUsd)) {
+      throw new Error("Enter a valid USDT dollar amount, like `25` or `100.50`.");
+    }
+    const usdAmount = Number(cleanedUsd);
+    if (!Number.isFinite(usdAmount) || usdAmount <= 0 || usdAmount > 1_000_000_000) {
+      throw new Error("Enter a valid USDT dollar amount, like `25` or `100.50`.");
+    }
+    const price = params.nativePriceUsd ?? 0;
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new Error(
+        `Couldn't fetch live ${params.nativeSymbol} price right now — try entering ${params.nativeSymbol} directly.`
+      );
+    }
+    const nativeAmountAtomic = usdToNativeAtomic(usdAmount, params.nativeDecimals, price);
+    if (nativeAmountAtomic <= 0n) {
+      throw new Error("Dollar amount is too small to convert.");
+    }
+    return { isUsd: true, usdAmount, nativeAmountAtomic };
+  }
+
+  const escapedSym = params.nativeSymbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const cleanedNative = trimmed.replace(new RegExp(`\\s*${escapedSym}$`, "i"), "").trim();
+  const nativeAmountAtomic = parseExactUnits(cleanedNative, params.nativeDecimals);
+  return { isUsd: false, usdAmount: null, nativeAmountAtomic };
+}
+
 /**
  * Computes how many token atomic units are received when spending `nativeNetAtomic`
  * at effective token price `tokenPriceNative` (expressed in native per 1 token).

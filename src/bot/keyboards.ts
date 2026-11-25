@@ -73,13 +73,15 @@ export function buildTokenTradeKeyboard(
     kb.text(`Buy ${amt} ${spec.nativeSymbol}`, packCallback(`b:${sc}:${tokenAddress}:${amt}`, `buy:${refId}:${amt}`));
   }
   kb.row()
+    .text("💵 Buy by USDT Value", packCallback(`bu:${sc}:${tokenAddress}`, `buyusd:${refId}`))
     .text(`✏️ Buy Custom ${spec.nativeSymbol}`, packCallback(`bc:${sc}:${tokenAddress}`, `buycustom:${refId}`))
+    .row()
     .text("🎯 Limit Buy", packCallback(`lb:${sc}:${tokenAddress}`, `limitbuy:${refId}`))
-    .row()
     .text("🔁 DCA Buy", packCallback(`db:${sc}:${tokenAddress}`, `dcabuy:${refId}`))
-    .text("🔄 Refresh", packCallback(`rf:${sc}:${tokenAddress}`, `refreshscan:${refId}`))
     .row()
+    .text("🔄 Refresh", packCallback(`rf:${sc}:${tokenAddress}`, `refreshscan:${refId}`))
     .text("📈 Positions", "nav:positions")
+    .row()
     .text("🏠 Home", "nav:home");
 
   return kb;

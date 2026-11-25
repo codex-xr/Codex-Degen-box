@@ -4,7 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { escapeMd, formatWalletLeaderboardMessage, stripMdForFallback } from "../src/bot/formatters.js";
+import { escapeMd, formatTokenScanMessage, formatWalletLeaderboardMessage, stripMdForFallback } from "../src/bot/formatters.js";
 import {
   buildDetectiveKeyboard,
   buildSettingsKeyboard,
@@ -27,7 +27,7 @@ import { TradingEngine } from "../src/services/tradingEngine.js";
 import { WalletDetectiveService, WalletInvestigationReport } from "../src/services/walletDetective.js";
 import { WalletWatcherService } from "../src/services/walletWatcher.js";
 import { WeeklyReportService } from "../src/services/weeklyReport.js";
-import { formatExactUnits, parseExactUnits, usdToNativeAtomic } from "../src/utils/amounts.js";
+import { formatExactUnits, parseExactUnits, parseNativeOrUsdInput, usdToNativeAtomic } from "../src/utils/amounts.js";
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -1326,7 +1326,9 @@ test("dev-launch pool snipe, Option B SL, proportional sells, cross-wallet LP ex
     for (const kb of [
       buildWatchersKeyboard([devWallet, traderWallet]),
       buildWatcherDetailKeyboard(devWallet),
-      buildSettingsKeyboard(await vault.getSettings())
+      buildSettingsKeyboard(await vault.getSettings()),
+      buildTokenTradeKeyboard("solana", "So11111111111111111111111111111111111111112", "0123456789"),
+      buildTokenTradeKeyboard("robinhood", "0x6B7a90776DeC2378E133c10fCd978847973b3906", "0123456789")
     ]) {
       for (const row of kb.inline_keyboard) {
         for (const btn of row) {
@@ -1341,6 +1343,127 @@ test("dev-launch pool snipe, Option B SL, proportional sells, cross-wallet LP ex
     await adminDb.close();
   } finally {
     globalThis.fetch = origFetch;
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
+    } catch {
+      // ignore Windows SQLite WAL file handle release delay
+    }
+  }
+});
+
+test("USDT-equivalent coin buy conversion, token card display, and buy execution", async () => {
+  const solUsd = 100;
+  const ethUsd = 2000;
+
+  // Explicit Buy-by-USDT prompt mode ("50" or "25.50" -> converts via live price)
+  const forced = parseNativeOrUsdInput({
+    raw: "50",
+    nativeDecimals: 9,
+    nativeSymbol: "SOL",
+    nativePriceUsd: solUsd,
+    forceUsd: true
+  });
+  assert.equal(forced.isUsd, true);
+  assert.equal(forced.usdAmount, 50);
+  assert.equal(forced.nativeAmountAtomic, parseExactUnits("0.5", 9));
+
+  // Explicit USD/USDT suffix & prefix inside regular prompts ("$100", "25 usdt", "100usdt", "25$", "0.25 SOL")
+  const ethFromUsdt = parseNativeOrUsdInput({
+    raw: "100 usdt",
+    nativeDecimals: 18,
+    nativeSymbol: "ETH",
+    nativePriceUsd: ethUsd
+  });
+  assert.equal(ethFromUsdt.isUsd, true);
+  assert.equal(ethFromUsdt.nativeAmountAtomic, parseExactUnits("0.05", 18));
+
+  const ethNoSpace = parseNativeOrUsdInput({
+    raw: "100usdt",
+    nativeDecimals: 18,
+    nativeSymbol: "ETH",
+    nativePriceUsd: ethUsd
+  });
+  assert.equal(ethNoSpace.isUsd, true);
+  assert.equal(ethNoSpace.nativeAmountAtomic, parseExactUnits("0.05", 18));
+
+  const solDollarSuffix = parseNativeOrUsdInput({
+    raw: "25$",
+    nativeDecimals: 9,
+    nativeSymbol: "SOL",
+    nativePriceUsd: solUsd
+  });
+  assert.equal(solDollarSuffix.isUsd, true);
+  assert.equal(solDollarSuffix.nativeAmountAtomic, parseExactUnits("0.25", 9));
+
+  const solDirect = parseNativeOrUsdInput({
+    raw: "0.25 SOL",
+    nativeDecimals: 9,
+    nativeSymbol: "SOL",
+    nativePriceUsd: 0
+  });
+  assert.equal(solDirect.isUsd, false);
+  assert.equal(solDirect.nativeAmountAtomic, parseExactUnits("0.25", 9));
+
+  assert.throws(
+    () =>
+      parseNativeOrUsdInput({
+        raw: "$50",
+        nativeDecimals: 9,
+        nativeSymbol: "SOL",
+        nativePriceUsd: 0
+      }),
+    /Couldn't fetch live SOL price/
+  );
+
+  // Token scan card shows USDT equivalent alongside native balance + Buy by USDT Value button
+  const snap = makeFakeSnap({ nativePriceUsd: 100 });
+  const scanMsg = formatTokenScanMessage(snap, makeSafeSecurity("solana"), parseExactUnits("2.5", 9));
+  assert.ok(scanMsg.includes("$250.00 USDT"));
+
+  const kb = buildTokenTradeKeyboard("solana", snap.address, "abc1234567");
+  const allButtons = kb.inline_keyboard.flat();
+  const usdBtn = allButtons.find((b) => "text" in b && b.text.includes("Buy by USDT Value"));
+  assert.ok(usdBtn && "callback_data" in usdBtn);
+  assert.ok(usdBtn.callback_data!.startsWith("bu:s:"));
+
+  // Execute actual buy using USD-converted atomic amount
+  const tmp = makeTempDir("degen-buyusd-");
+  try {
+    const adminDb = new AdminDb(path.join(tmp, "admin.db"), 5, "CODE1");
+    await adminDb.redeemCode({ code: "CODE1", telegramId: "555", username: "u555" });
+    const vaults = new UserVaultManager(path.join(tmp, "users"));
+    const vault = await vaults.getVault("555");
+    await vault.setVirtualFunds("solana", parseExactUnits("2", 9));
+    await vault.setSetting("priority_fee_sol", "0");
+
+    const cfg = loadConfig({ dataDir: tmp });
+    const evm = new EvmClientManager(cfg);
+    const sol = new SolanaClientManager(cfg);
+    const market = new MarketDataService(cfg, evm, sol);
+    const sec = new SecurityService(cfg, evm, sol);
+    market.getTokenSnapshot = async () => snap;
+    sec.checkToken = async () => makeSafeSecurity("solana");
+
+    const trading = new TradingEngine(market, sec);
+    const spend = parseNativeOrUsdInput({
+      raw: "50",
+      nativeDecimals: 9,
+      nativeSymbol: "SOL",
+      nativePriceUsd: 100,
+      forceUsd: true
+    });
+    const buyRes = await trading.executeBuy(vault, {
+      chain: "solana",
+      tokenAddress: snap.address,
+      spendNativeAtomic: spend.nativeAmountAtomic,
+      sourceType: "manual"
+    });
+    assert.equal(buyRes.nativeAmountAtomic, parseExactUnits("0.5", 9));
+    assert.ok(buyRes.qtyTokenAtomic > 0n);
+
+    await vaults.closeAll();
+    await adminDb.close();
+  } finally {
     try {
       fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 15, retryDelay: 100 });
     } catch {

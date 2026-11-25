@@ -27,9 +27,10 @@ import {
 import {
   formatExactUnits,
   formatUsd,
+  isExplicitUsdInput,
   nativeAtomicToUsd,
   parseExactUnits,
-  usdToNativeAtomic
+  parseNativeOrUsdInput
 } from "../utils/amounts.js";
 import {
   chainFromShortCode,
@@ -81,6 +82,16 @@ export { shortChainCode };
 
 function cleanDecimalInput(raw: string): string {
   return raw.replace(/[$,\s]/g, "");
+}
+
+function splitCompactAmountArgs(raw: string): string[] {
+  return raw
+    .trim()
+    .replace(/\$\s*(\d+(?:,\d{3})*(?:\.\d+)?)/g, "$$$1")
+    .replace(/(\d+(?:,\d{3})*(?:\.\d+)?)\s+\$/g, "$1$")
+    .replace(/(\d+(?:,\d{3})*(?:\.\d+)?)\s+(usdt?)\b/gi, "$1$2")
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
 const NAMED_ACCENT_COLORS: Record<string, string> = {
@@ -144,6 +155,22 @@ export function createTelegramBot(services: BotServices): Bot {
     string,
     { chain: ChainKey; address: string; alias?: string; report?: WalletInvestigationReport }
   >();
+
+  const resolveSpendAmount = async (chain: ChainKey, rawInput: string, forceUsd = false) => {
+    const spec = CHAINS[chain];
+    const needsPrice = forceUsd || isExplicitUsdInput(rawInput);
+    const nativePriceUsd = needsPrice ? await services.market.getNativePriceUsd(chain) : 0;
+    return {
+      ...parseNativeOrUsdInput({
+        raw: rawInput,
+        nativeDecimals: spec.nativeDecimals,
+        nativeSymbol: spec.nativeSymbol,
+        nativePriceUsd,
+        forceUsd
+      }),
+      nativePriceUsd
+    };
+  };
 
   const registerTokenRef = (chain: ChainKey, address: string): string => {
     const norm = normalizeAddress(chain, address);
@@ -612,7 +639,7 @@ export function createTelegramBot(services: BotServices): Bot {
   bot.command("buy", async (ctx) => {
     const ok = await requireAuthorized(ctx);
     if (!ok) return;
-    const parts = (ctx.match ?? "").trim().split(/\s+/).filter(Boolean);
+    const parts = splitCompactAmountArgs(ctx.match ?? "");
     if (parts.length === 0) {
       setPrompt(ok.telegramId, { kind: "await_buy_token_ca" }, ok.vault);
       await safeReply(ctx, "⚡ Paste the *token address* you want to scan or buy:");
@@ -630,12 +657,11 @@ export function createTelegramBot(services: BotServices): Bot {
     }
     const snap = snaps[0];
     try {
-      const spec = CHAINS[snap.chain];
-      const atomic = parseExactUnits(amtStr, spec.nativeDecimals);
+      const parsed = await resolveSpendAmount(snap.chain, amtStr);
       const res = await services.trading.executeBuy(ok.vault, {
         chain: snap.chain,
         tokenAddress: snap.address,
-        spendNativeAtomic: atomic,
+        spendNativeAtomic: parsed.nativeAmountAtomic,
         sourceType: "manual",
         snapshotOverride: snap
       });
@@ -828,12 +854,17 @@ export function createTelegramBot(services: BotServices): Bot {
 
   const sendBuySuccess = async (ctx: Context, res: ExecutionResult) => {
     const spec = CHAINS[res.chain];
+    const priceUsd = res.snapshot.nativePriceUsd;
+    const spentUsd = nativeAtomicToUsd(res.nativeAmountAtomic, spec.nativeDecimals, priceUsd);
+    const remUsd = nativeAtomicToUsd(res.remainingBalanceAtomic, spec.nativeDecimals, priceUsd);
+    const spentUsdStr = priceUsd > 0 ? ` (≈ *${formatUsd(spentUsd)} USDT*)` : "";
+    const remUsdStr = priceUsd > 0 ? ` (≈ *${formatUsd(remUsd)} USDT*)` : "";
     const msg =
       `✅ *Buy Complete!* (${spec.name})\n\n` +
       `🪙 Bought: *${formatExactUnits(res.qtyTokenAtomic, res.tokenDecimals, 4)} $${escapeMd(res.tokenSymbol)}*\n` +
-      `💵 Spent: \`${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`\n` +
+      `💵 Spent: \`${formatExactUnits(res.nativeAmountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`${spentUsdStr}\n` +
       `📊 Entry MC: *${formatUsd(res.mcUsd)}* (Impact: ${(res.slippageImpactBps / 100).toFixed(2)}%)\n` +
-      `💰 Remaining ${spec.shortBadge}: \`${formatExactUnits(res.remainingBalanceAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\``;
+      `💰 Remaining ${spec.shortBadge}: \`${formatExactUnits(res.remainingBalanceAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`${remUsdStr}`;
     const kb = new InlineKeyboard()
       .text("📈 View Position", `pos:view:${res.positionId}`)
       .text("🖼️ PnL Card", `pnlcard:${res.positionId}`)
@@ -1062,7 +1093,7 @@ export function createTelegramBot(services: BotServices): Bot {
       }
 
       // Token Trading (stateless callbacks + legacy RAM ref fallbacks)
-      const resolveTokenTarget = (kind: "refresh" | "buy" | "custom" | "limit" | "dca") => {
+      const resolveTokenTarget = (kind: "refresh" | "buy" | "custom" | "buyusd" | "limit" | "dca") => {
         if (parts[0] === "rf" && kind === "refresh") {
           const ch = chainFromShortCode(parts[1]);
           return ch && parts[2] ? { chain: ch, address: parts[2] } : undefined;
@@ -1072,6 +1103,10 @@ export function createTelegramBot(services: BotServices): Bot {
           return ch && parts[2] ? { chain: ch, address: parts[2], amount: parts[3] } : undefined;
         }
         if (parts[0] === "bc" && kind === "custom") {
+          const ch = chainFromShortCode(parts[1]);
+          return ch && parts[2] ? { chain: ch, address: parts[2] } : undefined;
+        }
+        if (parts[0] === "bu" && kind === "buyusd") {
           const ch = chainFromShortCode(parts[1]);
           return ch && parts[2] ? { chain: ch, address: parts[2] } : undefined;
         }
@@ -1110,6 +1145,31 @@ export function createTelegramBot(services: BotServices): Bot {
         return await sendBuySuccess(ctx, res);
       }
 
+      if (parts[0] === "bu" || parts[0] === "buyusd") {
+        const ref = resolveTokenTarget("buyusd") ?? tokenRefs.get(parts[1]);
+        if (!ref) return await safeReply(ctx, "⚠️ Please paste the token address again.");
+        const spec = CHAINS[ref.chain];
+        const [balRow, price] = await Promise.all([
+          vault.getBalance(ref.chain),
+          services.market.getNativePriceUsd(ref.chain).catch(() => 0)
+        ]);
+        const balUsd = nativeAtomicToUsd(balRow.balanceAtomic, spec.nativeDecimals, price);
+        setPrompt(telegramId, {
+          kind: "await_custom_buy_usd",
+          chain: ref.chain,
+          tokenAddress: ref.address
+        }, vault);
+        return await safeReply(
+          ctx,
+          `💵 Type the *USDT dollar amount* you want to spend to *BUY* this *${spec.name}* coin:\n` +
+            `💰 Balance: \`${formatExactUnits(balRow.balanceAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\`${
+              price > 0 ? ` (≈ *${formatUsd(balUsd)} USDT*)` : ""
+            }\n${
+              price > 0 ? `📊 Live rate: *1 ${spec.nativeSymbol} ≈ ${formatUsd(price)} USDT*\n` : ""
+            }_Example: \`25\` or \`100.50\` — I'll convert at the live rate and buy automatically!_`
+        );
+      }
+
       if (parts[0] === "bc" || parts[0] === "buycustom") {
         const ref = resolveTokenTarget("custom") ?? tokenRefs.get(parts[1]);
         if (!ref) return await safeReply(ctx, "⚠️ Please paste the token address again.");
@@ -1121,7 +1181,7 @@ export function createTelegramBot(services: BotServices): Bot {
         }, vault);
         return await safeReply(
           ctx,
-          `✏️ How much *${spec.nativeSymbol}* do you want to spend? (Any decimal allowed)`
+          `✏️ How much *${spec.nativeSymbol}* do you want to spend?\n_(Tip: type a ${spec.nativeSymbol} amount like \`0.5\`, OR a USDT amount like \`$50\` or \`50 usdt\`!)_`
         );
       }
 
@@ -1136,7 +1196,7 @@ export function createTelegramBot(services: BotServices): Bot {
         }, vault);
         return await safeReply(
           ctx,
-          `🎯 *Set Limit Buy*\nSend: \`<target_market_cap_usd> <spend_${spec.nativeSymbol}>\`\nExample: \`50000 0.5\` (buys 0.5 ${spec.nativeSymbol} if Market Cap drops to \$50,000 or below)`
+          `🎯 *Set Limit Buy*\nSend: \`<target_market_cap_usd> <spend_${spec.nativeSymbol}_or_USDT>\`\nExamples: \`50000 0.5\` or \`50000 $50\` (buys if Market Cap drops to \$50,000 or below)`
         );
       }
 
@@ -1151,7 +1211,7 @@ export function createTelegramBot(services: BotServices): Bot {
         }, vault);
         return await safeReply(
           ctx,
-          `🔁 *Set Auto-DCA*\nSend: \`<amount_per_buy> <minutes_between> <number_of_buys>\`\nExample: \`0.2 15 5\` (buys 0.2 ${spec.nativeSymbol} every 15 mins, 5 times)`
+          `🔁 *Set Auto-DCA*\nSend: \`<amount_per_buy> <minutes_between> <number_of_buys>\`\nExamples: \`0.2 15 5\` or \`$25 15 5\` (every 15 mins, 5 times)`
         );
       }
 
@@ -1298,7 +1358,7 @@ export function createTelegramBot(services: BotServices): Bot {
         setPrompt(telegramId, { kind: "await_edit_watch_amount", walletId }, vault);
         return await safeReply(
           ctx,
-          `💵 Type the new amount of *${spec.nativeSymbol}* to spend per copied trade (e.g. \`0.25\` or \`0.00005\`), a % like \`10%\`, OR \`0\` for Alert & Investigate Only:`
+          `💵 Type the new amount of *${spec.nativeSymbol}* (or USDT like \`$25\`) to spend per copied trade (e.g. \`0.25\`, \`$25\`, \`10%\`), OR \`0\` for Alert & Investigate Only:`
         );
       }
 
@@ -1784,22 +1844,15 @@ export function createTelegramBot(services: BotServices): Bot {
 
         case "await_add_balance_usd": {
           const spec = CHAINS[pending.chain];
-          const usdVal = Number(cleanDecimalInput(text));
-          if (!Number.isFinite(usdVal) || usdVal <= 0 || usdVal > 1_000_000_000) {
-            throw new Error("Enter a valid dollar amount, like `250` or `19.50`.");
-          }
-          const price = await services.market.getNativePriceUsd(pending.chain);
-          if (price <= 0) {
-            throw new Error(`Couldn't fetch live ${spec.nativeSymbol} price right now — try adding in ${spec.nativeSymbol} instead.`);
-          }
-          const addAtomic = usdToNativeAtomic(usdVal, spec.nativeDecimals, price);
-          if (addAtomic <= 0n) throw new Error("Dollar amount is too small to convert.");
+          const parsed = await resolveSpendAmount(pending.chain, text, true);
+          const usdVal = parsed.usdAmount ?? 0;
+          const addAtomic = parsed.nativeAmountAtomic;
           const nextBal = await vault.addVirtualFunds(pending.chain, addAtomic);
-          const totalUsd = nativeAtomicToUsd(nextBal, spec.nativeDecimals, price);
+          const totalUsd = nativeAtomicToUsd(nextBal, spec.nativeDecimals, parsed.nativePriceUsd);
           clearPrompt(telegramId, vault);
           await safeReply(
             ctx,
-            `✅ Added \`${formatExactUnits(addAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\` (≈ *${formatUsd(usdVal)} USDT* at *${formatUsd(price)}/${spec.nativeSymbol}*)!\nNew *${spec.name}* Balance: \`${formatExactUnits(nextBal, spec.nativeDecimals)} ${spec.nativeSymbol}\` (≈ *${formatUsd(totalUsd)} USDT*)`
+            `✅ Added \`${formatExactUnits(addAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}\` (≈ *${formatUsd(usdVal)} USDT* at *${formatUsd(parsed.nativePriceUsd)}/${spec.nativeSymbol}*)!\nNew *${spec.name}* Balance: \`${formatExactUnits(nextBal, spec.nativeDecimals)} ${spec.nativeSymbol}\` (≈ *${formatUsd(totalUsd)} USDT*)`
           );
           await showFundsScreen(vault, ctx, false);
           return;
@@ -1830,14 +1883,16 @@ export function createTelegramBot(services: BotServices): Bot {
           return;
         }
 
-        case "await_custom_buy_amount": {
-          const spec = CHAINS[pending.chain];
-          const atomic = parseExactUnits(cleanDecimalInput(text), spec.nativeDecimals);
+        case "await_custom_buy_amount":
+        case "await_custom_buy_usd": {
+          const forceUsd = pending.kind === "await_custom_buy_usd";
+          const parsed = await resolveSpendAmount(pending.chain, text, forceUsd);
+          if (parsed.nativeAmountAtomic <= 0n) throw new Error("Enter an amount greater than 0.");
           clearPrompt(telegramId, vault);
           const res = await services.trading.executeBuy(vault, {
             chain: pending.chain,
             tokenAddress: pending.tokenAddress,
-            spendNativeAtomic: atomic,
+            spendNativeAtomic: parsed.nativeAmountAtomic,
             sourceType: "manual"
           });
           await sendBuySuccess(ctx, res);
@@ -1873,13 +1928,15 @@ export function createTelegramBot(services: BotServices): Bot {
         }
 
         case "await_limit_buy": {
-          const [mcStr, amtStr] = text.split(/\s+/);
+          const [mcStr, amtStr] = splitCompactAmountArgs(text);
           const targetMc = Number((mcStr ?? "").replace(/[$,]/g, ""));
           if (!Number.isFinite(targetMc) || targetMc <= 0 || !amtStr) {
-            throw new Error("Send two numbers: `<target_mc_usd> <amount>`, e.g. `50000 0.5`");
+            throw new Error("Send two numbers: `<target_mc_usd> <amount>`, e.g. `50000 0.5` or `50000 $50`");
           }
           const spec = CHAINS[pending.chain];
-          const amountAtomic = parseExactUnits(cleanDecimalInput(amtStr), spec.nativeDecimals);
+          const parsed = await resolveSpendAmount(pending.chain, amtStr);
+          const amountAtomic = parsed.nativeAmountAtomic;
+          if (amountAtomic <= 0n) throw new Error("Amount must be greater than 0.");
           const snap = await services.market.getTokenSnapshot(pending.chain, pending.tokenAddress);
           const symbol = snap?.symbol ?? shortAddress(pending.tokenAddress);
           const id = await vault.createOrder({
@@ -1900,21 +1957,24 @@ export function createTelegramBot(services: BotServices): Bot {
             nextRunAt: null
           });
           clearPrompt(telegramId, vault);
+          const usdHint = parsed.isUsd && parsed.usdAmount ? ` (≈ *${formatUsd(parsed.usdAmount)} USDT*)` : "";
           return await safeReply(
             ctx,
-            `🎯 *Limit Buy #${id} Active!*\nWill buy *${formatExactUnits(amountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}* of *$${escapeMd(symbol)}* if Market Cap hits ≤ ${formatUsd(targetMc)}.`
+            `🎯 *Limit Buy #${id} Active!*\nWill buy *${formatExactUnits(amountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}*${usdHint} of *$${escapeMd(symbol)}* if Market Cap hits ≤ ${formatUsd(targetMc)}.`
           );
         }
 
         case "await_dca_buy": {
-          const [amtStr, minStr, countStr] = text.split(/[\s,]+/).filter(Boolean);
+          const [amtStr, minStr, countStr] = splitCompactAmountArgs(text);
           const intervalMin = Number((minStr ?? "").replace(/,/g, ""));
           const count = Math.floor(Number((countStr ?? "").replace(/,/g, "")));
           if (!amtStr || !Number.isFinite(intervalMin) || intervalMin < 1 || !Number.isFinite(count) || count < 1) {
-            throw new Error("Send 3 numbers: `<amount> <minutes> <count>`, e.g. `0.2 15 5`");
+            throw new Error("Send 3 numbers: `<amount> <minutes> <count>`, e.g. `0.2 15 5` or `$25 15 5`");
           }
           const spec = CHAINS[pending.chain];
-          const amountAtomic = parseExactUnits(cleanDecimalInput(amtStr), spec.nativeDecimals);
+          const parsed = await resolveSpendAmount(pending.chain, amtStr);
+          const amountAtomic = parsed.nativeAmountAtomic;
+          if (amountAtomic <= 0n) throw new Error("Amount must be greater than 0.");
           const snap = await services.market.getTokenSnapshot(pending.chain, pending.tokenAddress);
           const symbol = snap?.symbol ?? shortAddress(pending.tokenAddress);
           const id = await vault.createOrder({
@@ -1935,9 +1995,10 @@ export function createTelegramBot(services: BotServices): Bot {
             nextRunAt: Date.now()
           });
           clearPrompt(telegramId, vault);
+          const usdHint = parsed.isUsd && parsed.usdAmount ? ` (≈ *${formatUsd(parsed.usdAmount)} USDT*)` : "";
           return await safeReply(
             ctx,
-            `🔁 *DCA Order #${id} Started!*\nWill buy *${formatExactUnits(amountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}* of *$${escapeMd(symbol)}* every ${intervalMin}m (${count} times).`
+            `🔁 *DCA Order #${id} Started!*\nWill buy *${formatExactUnits(amountAtomic, spec.nativeDecimals)} ${spec.nativeSymbol}*${usdHint} of *$${escapeMd(symbol)}* every ${intervalMin}m (${count} times).`
           );
         }
 
@@ -2009,7 +2070,7 @@ export function createTelegramBot(services: BotServices): Bot {
           return await safeReply(
             ctx,
             `💵 How much virtual *${spec.nativeSymbol}* should be spent each time *${escapeMd(alias)}* buys?\n\n` +
-              `• Type any exact amount (e.g. \`0.25\`, \`0.0005\`, \`0.000000001\`)\n` +
+              `• Type any exact amount (e.g. \`0.25\`, \`$25\`, \`25 usdt\`, \`0.000000001\`)\n` +
               `• OR type a % of your balance (e.g. \`10%\`)\n` +
               `• OR type \`0\` to *Watch & Alert Only* (great for storage vaults!)`
           );
@@ -2028,7 +2089,8 @@ export function createTelegramBot(services: BotServices): Bot {
               throw new Error("Percentage must be between 0.01% and 100%.");
             }
           } else {
-            copyAmountAtomic = parseExactUnits(cleanDecimalInput(text), spec.nativeDecimals);
+            const parsed = await resolveSpendAmount(pending.chain, text);
+            copyAmountAtomic = parsed.nativeAmountAtomic;
             if (copyAmountAtomic < 0n) throw new Error("Amount cannot be negative.");
           }
 
@@ -2104,7 +2166,8 @@ export function createTelegramBot(services: BotServices): Bot {
               copyAmountAtomic: 0n
             });
           } else {
-            const amt = parseExactUnits(cleanDecimalInput(text), spec.nativeDecimals);
+            const parsed = await resolveSpendAmount(w.chain, text);
+            const amt = parsed.nativeAmountAtomic;
             if (amt < 0n) throw new Error("Amount cannot be negative.");
             await vault.updateWatchedWallet(w.id, {
               copyMode: "fixed",

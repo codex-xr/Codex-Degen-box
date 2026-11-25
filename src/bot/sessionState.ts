@@ -8,6 +8,7 @@ export type PendingPrompt =
   | { kind: "await_buy_token_ca"; chain?: ChainKey }
   | { kind: "await_investigate_address" }
   | { kind: "await_custom_buy_amount"; chain: ChainKey; tokenAddress: string }
+  | { kind: "await_custom_buy_usd"; chain: ChainKey; tokenAddress: string }
   | { kind: "await_custom_sell_amount"; positionId: number }
   | { kind: "await_limit_buy"; chain: ChainKey; tokenAddress: string }
   | { kind: "await_dca_buy"; chain: ChainKey; tokenAddress: string }
